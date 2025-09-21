@@ -1,0 +1,269 @@
+# Backend .gitignore for HL7 Workflow Management System
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# Environment files (SECURITY CRITICAL)
+*.env
+*.env.*
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+.env.staging
+
+# Database (SECURITY CRITICAL)
+*.db
+*.sqlite
+*.sqlite3
+database.config
+db-passwords.txt
+connection-strings.txt
+data/
+db/
+
+# Secrets and credentials (SECURITY CRITICAL)
+*secret*
+*private*
+*credentials*
+*token*
+*.key
+*.pem
+*.p12
+*.pfx
+secrets/
+credentials/
+keys/
+
+# VPN configurations (SECURITY CRITICAL)
+*.ovpn
+*.conf
+vpn-configs/
+ca-certificates/
+client-certificates/
+
+# Email configurations
+smtp-config.json
+email-templates/private/
+
+# Alembic
+alembic/versions/*.py
+!alembic/versions/001_initial_migration.py
+
+# FastAPI
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Logs
+*.log
+*.log.*
+logs/
+log/
+dump.rdb
+
+# File uploads and user data
+uploads/
+static/uploads/
+tmp/
+temp/
+user-files/
+
+# Cache directories
+.cache/
+cache/
+__pycache__/
+
+# IDE and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.spyderproject
+.spyproject
+.ropeproject
+*.sublime-workspace
+*.sublime-project
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+ehthumbs_vista.db
+Thumbs.db
+Desktop.ini
+
+# Docker
+.dockerignore.local
+docker-compose.override.yml
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# poetry
+poetry.lock
+
+# celery beat schedule file
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# S3 and cloud storage
+s3-config.json
+gcs-config.json
+azure-config.json
+
+# Redis
+redis.conf
+
+# Backup files
+*.backup
+*.bak
+*.old
+
+# Temporary files
+*.tmp
+*.temp
+
+# Migration files (keep structure, ignore data)
+!migrations/
+!migrations/env.py
+!migrations/script.py.mako
+!migrations/versions/
+!migrations/versions/001_initial_migration.py
+
+# Keep static assets structure but ignore user uploads
+!static/
+static/uploads/
+!static/platform/
+!static/.keep
+
+# Development and testing
+.coverage
+.pytest_cache/
+test-results/
+test-reports/
+
+# Local development
+local/
+.local/
+dev-config/
+
+# Package files
+*.tar.gz
+*.zip
+*.rar
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Node.js (if any JS tooling is used)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Optional npm cache directory
+.npm
+
+# Optional eslint cache
+.eslintcache
