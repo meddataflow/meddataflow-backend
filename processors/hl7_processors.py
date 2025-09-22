@@ -57,7 +57,8 @@ async def process_hl7_parser_activity(activity: Dict[str, Any], context: Workflo
                     context.variables[var_name] = message_type
                 else:
                     value = _extract_hl7_field_value(context.raw_message, var_source, var_default)
-                    logger.info(f"🔧 HL7_PARSER: Extracted {var_name} from {var_source}: {value}")
+                    # PHI-safe logging - only log field path and success status
+                    logger.info(f"🔧 HL7_PARSER: Extracted {var_name} from {var_source}: {'[VALUE_EXTRACTED]' if value else '[NO_VALUE]'}")
                     extracted_vars[var_name] = value
                     context.variables[var_name] = value
 
@@ -79,10 +80,11 @@ async def process_hl7_parser_activity(activity: Dict[str, Any], context: Workflo
         )
 
     except Exception as e:
-        logger.error(f"Error parsing HL7 message: {e}")
+        # PHI-safe error logging - don't include message content
+        logger.error(f"Error parsing HL7 message: {type(e).__name__}")
         return ActivityResult(
             status=ActivityStatus.FAILED,
-            error_message=f"Failed to parse HL7 message: {str(e)}"
+            error_message=f"Failed to parse HL7 message: {type(e).__name__}"
         )
 
 
@@ -136,10 +138,11 @@ async def process_hl7_transformer_activity(activity: Dict[str, Any], context: Wo
             )
 
     except Exception as e:
-        logger.error(f"Error transforming HL7 message: {e}")
+        # PHI-safe error logging - don't include message content
+        logger.error(f"Error transforming HL7 message: {type(e).__name__}")
         return ActivityResult(
             status=ActivityStatus.FAILED,
-            error_message=f"Failed to transform HL7 message: {str(e)}"
+            error_message=f"Failed to transform HL7 message: {type(e).__name__}"
         )
 
 

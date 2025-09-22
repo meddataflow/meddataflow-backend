@@ -24,6 +24,21 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+# all the pycahe files
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+
+# all the pycache directories
+__pycache__/
+__pypackages__/
+
+# all the internal pycache directories
+*/__pycache__/
+*/__pypackages__/
+
+
 # PyInstaller
 *.manifest
 *.spec

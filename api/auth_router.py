@@ -4,9 +4,14 @@ Authentication router for meddataflow platform
 import uuid
 from typing import Optional, Dict, Any
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 import os
 from pydantic import BaseModel, EmailStr
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+# Initialize limiter
+limiter = Limiter(key_func=get_remote_address)
 
 from services.auth_service import AuthService, TenantService
 from api.auth_deps import get_current_user, get_current_tenant, require_super_admin
@@ -125,10 +130,11 @@ class Reset2FAResponse(BaseModel):
 
 # Authentication endpoints
 @router.post("/login", response_model=LoginResponse)
-async def login(request: LoginRequest):
+@limiter.limit("5/minute")
+async def login(request: Request, login_request: LoginRequest):
     """User login endpoint"""
     user = await AuthService.authenticate_user(
-        request.email, request.password, request.tenant_slug
+        login_request.email, login_request.password, login_request.tenant_slug
     )
 
     if not user:
@@ -141,8 +147,8 @@ async def login(request: LoginRequest):
     if user and user.get('role') != UserRole.SUPER_ADMIN:
         # Determine tenant to check
         tid = None
-        if request.tenant_slug:
-            tenant = await TenantService.get_tenant_by_slug(request.tenant_slug)
+        if login_request.tenant_slug:
+            tenant = await TenantService.get_tenant_by_slug(login_request.tenant_slug)
             if tenant:
                 tid = tenant.get('id')
         elif user.get('tenant_id'):
@@ -156,7 +162,7 @@ async def login(request: LoginRequest):
 
     # Check if 2FA is enabled
     if user.get('two_factor_enabled'):
-        if not request.totp_code:
+        if not login_request.totp_code:
             raise HTTPException(
                 status_code=status.HTTP_202_ACCEPTED,
                 detail="2FA_REQUIRED"
@@ -164,7 +170,7 @@ async def login(request: LoginRequest):
 
         # Verify 2FA code
         user_uuid = user['id'] if isinstance(user['id'], uuid.UUID) else uuid.UUID(user['id'])
-        if not await UserRepository.verify_two_factor(user_uuid, request.totp_code):
+        if not await UserRepository.verify_two_factor(user_uuid, login_request.totp_code):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid 2FA code"
@@ -206,14 +212,15 @@ async def login(request: LoginRequest):
     )
 
 @router.post("/register", response_model=RegisterResponse)
-async def register(request: RegisterRequest):
+@limiter.limit("3/minute")
+async def register(request: Request, register_request: RegisterRequest):
     """User registration endpoint"""
     user = await AuthService.register_user(
-        email=request.email,
-        password=request.password,
-        first_name=request.first_name,
-        last_name=request.last_name,
-        tenant_slug=request.tenant_slug
+        email=register_request.email,
+        password=register_request.password,
+        first_name=register_request.first_name,
+        last_name=register_request.last_name,
+        tenant_slug=register_request.tenant_slug
     )
     
     return RegisterResponse(
@@ -454,7 +461,8 @@ async def regenerate_backup_codes(current_user: Dict[str, Any] = Depends(get_cur
 
 # Password reset endpoints
 @router.post("/forgot-password", response_model=ForgotPasswordResponse)
-async def forgot_password(req: ForgotPasswordRequest):
+@limiter.limit("3/hour")
+async def forgot_password(request: Request, req: ForgotPasswordRequest):
     """Request a password reset. Always return 200 to avoid user enumeration."""
     # Try to find user by email (global or by tenant_slug if provided)
     user = None

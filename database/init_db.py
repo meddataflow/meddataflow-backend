@@ -137,29 +137,29 @@ async def seed_database():
         
         sample_hl7_messages = [
             {
-                "raw_message": """MSH|^~\\&|EPIC|EPICADT|SMS|SMSADT|199912271408|CHARRIS|ADT^A04|1817457|D|2.5||
-EVN||199912271408||199912271408
-PID|0001|0000112234^^^MR|0000112234^^^MR~444333333^^^SSN||EVERYMAN^ADAM||19661003|M||C|1200 N ELM STREET^^GREENSBORO^NC^27401-1020|GL|(919)379-1212|(919)271-3434||S||PATID12345001^2^M10|123456789|9-87654^NC||
-NK1|0001|JONES^BARBARA^K|12|171 ZOBERLEIN^^GREENSBORO^NC^27410-1020|(919)349-2000|(919)332-1800||||||||||||||||||||||||||||
-PV1|0001|I|2000^2012^01||||004777^ATTEND^AARON^A|||SUR|||A0||19|1
-AL1|1||^PENICILLIN^L|MO|SHORTNESS OF BREATH
-DG1|001|I9|^784.0^I9|SHORTNESS OF BREATH||A""",
+                "raw_message": """MSH|^~\\&|DEMO_EMR|DEMO_FACILITY|TARGET_SYS|TARGET_FACILITY|20240101120000|USER001|ADT^A04|MSG001|P|2.5||
+EVN||20240101120000||20240101120000
+PID|0001|TEST001^^^MR|TEST001^^^MR~999999999^^^SSN||TEST^PATIENT^A||19900101|M||U|123 DEMO STREET^^DEMO CITY^ST^12345||(555)555-0001|(555)555-0002||S||TEST001^2^M10|999999999|DL123456^ST||
+NK1|0001|TEST^CONTACT^K|02|456 CONTACT STREET^^DEMO CITY^ST^12346|(555)555-0003|(555)555-0004||||||||||||||||||||||||||||
+PV1|0001|I|ICU^101^A||||DOC001^PHYSICIAN^ATTENDING^A|||MED|||A0||19|1
+AL1|1||^DEMO_ALLERGY^L|MO|DEMO REACTION
+DG1|001|I10|^Z00.00^I10|DEMO DIAGNOSIS||A""",
                 "message_type": "ADT^A04",
                 "event_type": "A04",
                 "hl7_version": "2.5",
-                "sending_application": "EPIC",
-                "receiving_application": "SMS"
+                "sending_application": "DEMO_EMR",
+                "receiving_application": "TARGET_SYS"
             },
             {
-                "raw_message": """MSH|^~\\&|CERNER|CERNERADT|SMS|SMSADT|199912271409|CHARRIS|ORM^O01|1817458|D|2.5||
-PID|0001|0000112235^^^MR|0000112235^^^MR~555444444^^^SSN||DOE^JANE||19801215|F||C|300 MAIN STREET^^CHARLOTTE^NC^28202-1010|GL|(704)555-1234|(704)555-5678||M||PATID12345002^2^M10|987654321|9-12345^NC||
-ORC|NW|12345^CERNER|67890^SMS||CM||||199912271409|^SMITH^JOHN^A||^DOCTOR^ATTENDING
-OBR|1|12345^CERNER|67890^SMS|^CBC^CBC with Differential||199912271409|||^SMITH^JOHN^A||||||199912271409|S||^SMITH^JOHN^A||||||||F""",
+                "raw_message": """MSH|^~\\&|DEMO_LAB|DEMO_FACILITY|TARGET_SYS|TARGET_FACILITY|20240101130000|USER002|ORM^O01|MSG002|P|2.5||
+PID|0001|TEST002^^^MR|TEST002^^^MR~888888888^^^SSN||DEMO^PATIENT^B||19850615|F||U|789 TEST AVENUE^^DEMO CITY^ST^12347|(555)555-0005|(555)555-0006||M||TEST002^2^M10|888888888|DL789012^ST||
+ORC|NW|ORDER001^DEMO_LAB|ORDER001^TARGET_SYS||CM||||20240101130000|^PHYSICIAN^ORDERING^A||^DOCTOR^ATTENDING
+OBR|1|ORDER001^DEMO_LAB|ORDER001^TARGET_SYS|^LAB001^DEMO LAB TEST||20240101130000|||^PHYSICIAN^ORDERING^A||||||20240101130000|S||^PHYSICIAN^ORDERING^A||||||||F""",
                 "message_type": "ORM^O01",
                 "event_type": "O01",
                 "hl7_version": "2.5",
-                "sending_application": "CERNER",
-                "receiving_application": "SMS"
+                "sending_application": "DEMO_LAB",
+                "receiving_application": "TARGET_SYS"
             }
         ]
         
@@ -177,13 +177,13 @@ OBR|1|12345^CERNER|67890^SMS|^CBC^CBC with Differential||199912271409|||^SMITH^J
                 receiving_application=msg_data["receiving_application"],
                 parsed_message=json.dumps({
                     "segments": ["MSH", "EVN", "PID", "PV1"] if i == 0 else ["MSH", "PID", "ORC", "OBR"],
-                    "patient_id": "0000112234" if i == 0 else "0000112235",
-                    "message_control_id": "1817457" if i == 0 else "1817458"
+                    "patient_id": "TEST001" if i == 0 else "TEST002",
+                    "message_control_id": "MSG001" if i == 0 else "MSG002"
                 }),
                 english_translation=json.dumps({
-                    "summary": f"Patient {'admission' if i == 0 else 'order'} message",
+                    "summary": f"Demo {'admission' if i == 0 else 'order'} message",
                     "details": [
-                        f"Patient {'Adam Everyman' if i == 0 else 'Jane Doe'} message received",
+                        f"Demo patient message received",
                         f"Message type: {msg_data['message_type']}",
                         f"From: {msg_data['sending_application']}"
                     ]

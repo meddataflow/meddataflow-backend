@@ -61,6 +61,20 @@ logger = logging.getLogger(__name__)
 
 
 class WorkflowExecutionService:
+
+    def _is_phi_field(self, field_name: str) -> bool:
+        """Check if a field name might contain PHI data"""
+        phi_indicators = [
+            'patient', 'name', 'first_name', 'last_name', 'address', 'phone', 'email',
+            'ssn', 'mrn', 'dob', 'birth', 'age', 'sex', 'gender', 'race', 'ethnicity',
+            'insurance', 'account', 'diagnosis', 'procedure', 'medication', 'allergy',
+            'contact', 'emergency', 'employer', 'guardian', 'next_of_kin', 'raw_message',
+            'hl7_message', 'parsed_message', 'message_content', 'pid', 'pv1', 'nk1',
+            'al1', 'dg1', 'pr1', 'in1', 'gt1', 'obx', 'nte'
+        ]
+        field_lower = field_name.lower()
+        return any(indicator in field_lower for indicator in phi_indicators)
+
     """
     Service for executing workflows with comprehensive activity processors
     Implements the main goal pattern: Receiver → Filter → Transform → CSV → S3
@@ -172,13 +186,16 @@ class WorkflowExecutionService:
                     continue
 
                 context.current_activity = activity["name"]
-                logger.info(f"🔧 WORKFLOW_EXEC: Starting activity '{activity['name']}' with variables: {context.variables}")
+                safe_starting_keys = [k for k in context.variables.keys() if not self._is_phi_field(k)]
+                logger.info(f"🔧 WORKFLOW_EXEC: Starting activity '{activity['name']}' with {len(context.variables)} variables: {safe_starting_keys}")
                 result = await self._execute_activity(activity, context)
 
-                # Update context with results
-                logger.info(f"🔧 WORKFLOW_EXEC: Activity '{activity['name']}' returned variables: {result.variables}")
+                # Update context with results - PHI-safe logging
+                safe_var_keys = [k for k in result.variables.keys() if not self._is_phi_field(k)]
+                logger.info(f"🔧 WORKFLOW_EXEC: Activity '{activity['name']}' returned {len(result.variables)} variables: {safe_var_keys}")
                 context.variables.update(result.variables)
-                logger.info(f"🔧 WORKFLOW_EXEC: Context variables after '{activity['name']}': {context.variables}")
+                safe_context_keys = [k for k in context.variables.keys() if not self._is_phi_field(k)]
+                logger.info(f"🔧 WORKFLOW_EXEC: Context has {len(context.variables)} variables: {safe_context_keys}")
 
                 # Log activity execution
                 self._log_activity_execution(context, activity, result)
@@ -322,20 +339,22 @@ class WorkflowExecutionService:
         )
 
         try:
-            # Add debugging for HL7 and database activities
+            # Add debugging for HL7 and database activities - PHI-safe logging
             if activity_type in ['hl7_parser', 'hl7_transformer', 'hl7_to_csv', 'hl7_to_fhir', 'database_write']:
                 logger.info(f"Executing activity: {activity_type}, raw_message present: {bool(context.raw_message)}")
                 if context.raw_message:
                     logger.info(f"Raw message length: {len(context.raw_message)}")
-                logger.info(f"Context variables: {list(context.variables.keys())}")
+                safe_var_keys = [k for k in context.variables.keys() if not self._is_phi_field(k)]
+                logger.info(f"Context variables (PHI-safe): {safe_var_keys}")
 
             result = await processor(activity, context)
 
-            # Add debugging for results
+            # Add debugging for results - PHI-safe logging
             if activity_type in ['hl7_parser', 'hl7_transformer', 'hl7_to_csv', 'hl7_to_fhir', 'database_write']:
                 logger.info(f"Activity {activity_type} result: {result.status}, error: {result.error_message}")
                 if result.variables:
-                    logger.info(f"Variables after {activity_type}: {result.variables}")
+                    safe_result_keys = [k for k in result.variables.keys() if not self._is_phi_field(k)]
+                    logger.info(f"Variables after {activity_type} (PHI-safe): {safe_result_keys}")
 
             end_time = datetime.utcnow()
             result.execution_time_ms = int((end_time - start_time).total_seconds() * 1000)

@@ -90,7 +90,8 @@ class HL7MapperService:
             return result
             
         except Exception as e:
-            print(f"Error in HL7 to CSV mapping: {e}")
+            # PHI-safe error logging - don't include message content
+            print(f"Error in HL7 to CSV mapping: {type(e).__name__}")
             return self._fallback_hl7_to_csv(hl7_message, csv_config)
     
     def create_hl7_to_hl7_mapping(self, hl7_message: str, transform_config: Dict[str, Any]) -> Optional[str]:
@@ -142,7 +143,8 @@ class HL7MapperService:
             return hl7_message
             
         except Exception as e:
-            print(f"Error in HL7 to HL7 transformation: {e}")
+            # PHI-safe error logging - don't include message content
+            print(f"Error in HL7 to HL7 transformation: {type(e).__name__}")
             return self._fallback_hl7_to_hl7(hl7_message, transform_config)
     
     def _fallback_hl7_to_csv(self, hl7_message: str, csv_config: Dict[str, Any]) -> Any:
@@ -232,7 +234,8 @@ class HL7MapperService:
             return self._rebuild_hl7_message(segments, transformed_segments, new_segments)
             
         except Exception as e:
-            print(f"Error in fallback HL7 transformation: {e}")
+            # PHI-safe error logging - don't include message content
+            print(f"Error in fallback HL7 transformation: {type(e).__name__}")
             return hl7_message
     
     def parse_hl7_segments(self, hl7_message: str) -> Dict[str, List[str]]:

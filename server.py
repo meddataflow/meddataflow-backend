@@ -7,6 +7,9 @@ from pathlib import Path
 import os
 import logging
 import uvicorn
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # Import simplified security features
 try:
@@ -48,6 +51,7 @@ from api.public_router import router as public_router
 from api.sso_router import router as sso_router
 from api.admin_plans_router import router as plans_router
 from api.ai_workflow_router import router as ai_workflow_router
+from api.admin.audit_log import router as audit_log_router
 
 # Configure logging
 logging.basicConfig(
@@ -55,6 +59,9 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Initialize rate limiter
+limiter = Limiter(key_func=get_remote_address)
 
 # Create FastAPI app
 app = FastAPI(
@@ -65,6 +72,10 @@ app = FastAPI(
     redoc_url="/redoc",
     redirect_slashes=False
 )
+
+# Add rate limiting to the app
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # Security middleware (order matters - from innermost to outermost)
@@ -86,15 +97,29 @@ else:
             log_request(request)
         return response
 
-# CORS middleware
+# CORS middleware with debug logging
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3001").split(","),
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers", "X-CSRF-Token"],
     max_age=86400  # 24 hours
 )
+
+# Add debug middleware to log CORS issues
+@app.middleware("http")
+async def cors_debug_middleware(request: Request, call_next):
+    if request.method == "OPTIONS":
+        logger.info(f"CORS Preflight: {request.url} from {request.headers.get('origin')}")
+        logger.info(f"Request headers: {dict(request.headers)}")
+
+    response = await call_next(request)
+
+    if request.method == "OPTIONS":
+        logger.info(f"CORS Response status: {response.status_code}")
+
+    return response
 
 # Create API router with /api prefix
 api_router = APIRouter(prefix="/api")
@@ -147,6 +172,7 @@ app.include_router(public_router)
 app.include_router(sso_router)
 app.include_router(plans_router)
 app.include_router(ai_workflow_router)
+app.include_router(audit_log_router)
 app.include_router(api_router)
 
 # Serve static files (e.g., uploaded logos)

@@ -7,6 +7,8 @@ import subprocess
 import tempfile
 import os
 import time
+import shlex
+import re
 from typing import Dict, Any, Optional
 from dataclasses import dataclass, field
 from enum import Enum
@@ -20,6 +22,7 @@ import logging
 
 # Import models
 from models.workflow_models import WorkflowContext, ActivityResult, ActivityStatus
+from processors.validation import validate_activity_config, sanitize_sql_query
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,21 @@ class VPNConfig:
     client_cert: Optional[str] = None
     client_key: Optional[str] = None
 
+    def validate_inputs(self):
+        """Validate VPN configuration inputs for security"""
+        if self.server:
+            # Validate server hostname/IP - allow only alphanumeric, dots, and hyphens
+            if not re.match(r'^[a-zA-Z0-9.-]+$', self.server):
+                raise ValueError("Invalid server hostname/IP format")
+
+        if self.username:
+            # Validate username - allow alphanumeric, underscore, at sign, and dots
+            if not re.match(r'^[a-zA-Z0-9._@-]+$', self.username):
+                raise ValueError("Invalid username format")
+
+        if self.port and not (1 <= self.port <= 65535):
+            raise ValueError("Port must be between 1 and 65535")
+
 
 class VPNManager:
     """Manages VPN connections for database access"""
@@ -50,6 +68,9 @@ class VPNManager:
         try:
             if not vpn_config.enabled:
                 return True
+
+            # Validate inputs before processing
+            vpn_config.validate_inputs()
 
             logger.info(f"Establishing VPN connection for tenant {tenant_id}")
 
@@ -89,12 +110,17 @@ class VPNManager:
                 if vpn_config.config_file:
                     f.write(vpn_config.config_file)
                 else:
-                    # Build basic config
+                    # Build basic config with validation
+                    server = shlex.quote(str(vpn_config.server))
+                    port = vpn_config.port or 1194
+                    if not (1 <= port <= 65535):
+                        raise ValueError("Invalid port number")
+
                     config_content = f"""
 client
 dev tun
 proto udp
-remote {vpn_config.server} {vpn_config.port or 1194}
+remote {server} {port}
 resolv-retry infinite
 nobind
 persist-key
@@ -182,13 +208,18 @@ verb 3
     async def _connect_cisco_anyconnect(self, tenant_id: str, vpn_config: VPNConfig) -> bool:
         """Connect using Cisco AnyConnect"""
         try:
-            # Use expect script for AnyConnect automation
+            # Validate and sanitize inputs
+            if not vpn_config.server or not vpn_config.username or not vpn_config.password:
+                logger.error("Cisco AnyConnect requires server, username, and password")
+                return False
+
+            # Use expect script for AnyConnect automation with proper escaping
             expect_script = f"""#!/usr/bin/expect
-spawn /opt/cisco/anyconnect/bin/vpn connect {vpn_config.server}
+spawn /opt/cisco/anyconnect/bin/vpn connect {shlex.quote(vpn_config.server)}
 expect "Username:"
-send "{vpn_config.username}\\r"
+send {shlex.quote(vpn_config.username)}\\r
 expect "Password:"
-send "{vpn_config.password}\\r"
+send {shlex.quote(vpn_config.password)}\\r
 expect "VPN>"
 exit 0
 """
@@ -196,7 +227,8 @@ exit 0
                 f.write(expect_script)
                 script_path = f.name
 
-            process = subprocess.run(["expect", script_path], capture_output=True, text=True)
+            # Use subprocess with proper arguments instead of shell execution
+            process = subprocess.run(["expect", script_path], capture_output=True, text=True, timeout=60)
 
             if "Connected" in process.stdout:
                 self.active_connections[tenant_id] = {
@@ -224,8 +256,17 @@ async def process_database_write_activity(
 ) -> ActivityResult:
     """Process Database Write activity with support for multiple database types and VPN connections"""
     import asyncio
+    from marshmallow import ValidationError
 
-    config = activity.get("config", {})
+    try:
+        # Validate configuration
+        config = validate_activity_config('database_write', activity.get("config", {}))
+    except ValidationError as e:
+        return ActivityResult(
+            status=ActivityStatus.FAILED,
+            error_message=f"Configuration validation failed: {e}"
+        )
+
     db_type = config.get("database_type", "postgresql")
     connection_config = config.get("connection", {})
     query_config = config.get("query_config", {})
@@ -267,6 +308,15 @@ async def process_database_write_activity(
     query = query_config.get("query", config.get("query", ""))
     query_type = query_config.get("query_type", "insert")
     table_name = query_config.get("table_name", "")
+
+    # Sanitize query
+    try:
+        query = sanitize_sql_query(query, query_type)
+    except ValidationError as e:
+        return ActivityResult(
+            status=ActivityStatus.FAILED,
+            error_message=f"Query validation failed: {e}"
+        )
 
     # Extract parameters for parameterized queries (SQL injection protection)
     query_parameters = []
