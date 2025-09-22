@@ -39,3 +39,5 @@ google-cloud-storage>=3.4.0
 # Input validation and security
 marshmallow>=3.20.0
 slowapi>=0.1.9
+
+colorama>=0.4.6

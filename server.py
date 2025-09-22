@@ -107,17 +107,6 @@ app.add_middleware(
     max_age=86400  # 24 hours
 )
 
-# Add debug middleware to log CORS issues
-@app.middleware("http")
-async def cors_debug_middleware(request: Request, call_next):
-    if request.method == "OPTIONS":
-
-    response = await call_next(request)
-
-    if request.method == "OPTIONS":
-
-    return response
-
 # Create API router with /api prefix
 api_router = APIRouter(prefix="/api")
 
@@ -188,6 +177,7 @@ async def startup_event():
         
         # Test database connection
         if await test_connection():
+            pass
         else:
             logger.warning("Database health check failed")
         

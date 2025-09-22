@@ -385,7 +385,6 @@ async def process_condition_activity(
                     # Use frontend-style action instead of legacy action
                     action_taken = _execute_frontend_condition_action(on_true_action, context)
                     break
-                else:
             else:
                 logger.warning(f"🔧 CONDITION_EVAL: Variable '{variable}' NOT FOUND in context")
 
