@@ -67,7 +67,6 @@ class SettingsService:
                 datetime.now(timezone.utc)
             )
 
-            logger.info("AI settings updated successfully")
             return True
 
         except Exception as e:
@@ -296,7 +295,6 @@ class SettingsService:
             await execute(create_settings_table)
             await execute(create_logs_table)
 
-            logger.info("Settings tables ensured")
 
         except Exception as e:
             logger.error(f"Error ensuring settings tables: {e}")

@@ -297,7 +297,6 @@ async def ingest_hl7_message(
             response_data["workflow_triggered"] = False
             response_data["note"] = "No workflow configured for this vendor endpoint"
         
-        logger.info(f"Successfully processed HL7 message from vendor {vendor_slug}: {message_id}")
         return response_data
         
     except HTTPException:
@@ -347,7 +346,6 @@ async def trigger_workflow_async(
         # Execute workflow (this is a simplified version - in production you'd use a proper workflow object)
         execution_id = f"exec_{uuid.uuid4()}"
         
-        logger.info(f"Triggered workflow {workflow_id} for message {message_id} with execution ID {execution_id}")
         
         # Update message status to processed
         await execute(

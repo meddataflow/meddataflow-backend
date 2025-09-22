@@ -74,7 +74,6 @@ class InMemoryQueue:
     def register_handler(self, task_type: str, handler):
         """Register a handler function for a specific task type"""
         self.task_handlers[task_type] = handler
-        logger.info(f"Registered handler for task type: {task_type}")
     
     async def enqueue(self, task: Task) -> str:
         """Add a task to the queue"""
@@ -93,7 +92,6 @@ class InMemoryQueue:
         if not inserted:
             self.pending_queue.append(task.task_id)
         
-        logger.info(f"Enqueued task {task.task_id} of type {task.task_type}")
         return task.task_id
     
     def get_task(self, task_id: str) -> Optional[Task]:
@@ -114,7 +112,6 @@ class InMemoryQueue:
             asyncio.create_task(self._worker(f"worker-{i}"))
             for i in range(self.max_workers)
         ]
-        logger.info(f"Started {self.max_workers} queue workers")
     
     async def stop_workers(self):
         """Stop worker coroutines"""
@@ -125,11 +122,9 @@ class InMemoryQueue:
         
         await asyncio.gather(*self.workers, return_exceptions=True)
         self.workers = []
-        logger.info("Stopped all queue workers")
     
     async def _worker(self, worker_name: str):
         """Worker coroutine that processes tasks"""
-        logger.info(f"Started queue worker: {worker_name}")
         
         while self.running:
             try:
@@ -177,7 +172,6 @@ class InMemoryQueue:
     async def _process_task(self, worker_name: str, task: Task):
         """Process a single task"""
         try:
-            logger.info(f"{worker_name} processing task {task.task_id} of type {task.task_type}")
             
             task.attempts += 1
             task.updated_at = datetime.utcnow()
@@ -196,7 +190,6 @@ class InMemoryQueue:
             task.result = result
             task.updated_at = datetime.utcnow()
             
-            logger.info(f"{worker_name} completed task {task.task_id}")
             
         except Exception as e:
             logger.error(f"{worker_name} failed processing task {task.task_id}: {e}")
@@ -211,7 +204,6 @@ class InMemoryQueue:
                 
                 # Re-add to pending queue for retry
                 self.pending_queue.append(task.task_id)
-                logger.info(f"Scheduled task {task.task_id} for retry {task.attempts}/{task.max_retries}")
             else:
                 task.status = TaskStatus.FAILED
                 logger.error(f"Task {task.task_id} failed after {task.attempts} attempts")
@@ -239,12 +231,10 @@ class QueueService:
     async def start(self):
         """Start the queue service"""
         await self.queue.start_workers()
-        logger.info("Queue service started")
     
     async def stop(self):
         """Stop the queue service"""
         await self.queue.stop_workers()
-        logger.info("Queue service stopped")
     
     async def enqueue_workflow_execution(
         self,
@@ -442,7 +432,6 @@ class QueueService:
         processing_config = payload["processing_config"]
         
         # Simulate HL7 processing
-        logger.info(f"Processing HL7 message {message_id}")
         
         # Add processing logic here
         await asyncio.sleep(1)  # Simulate processing time
@@ -460,7 +449,6 @@ class QueueService:
         tenant_id = payload["tenant_id"]
         
         # Simulate data export
-        logger.info(f"Exporting {export_type} data for tenant {tenant_id}")
         
         # Add export logic here
         await asyncio.sleep(5)  # Simulate export time
@@ -480,7 +468,6 @@ class QueueService:
         message = payload.get("message")
         
         # Simulate sending notification
-        logger.info(f"Sending {notification_type} notification to {recipient}")
         
         await asyncio.sleep(0.5)  # Simulate sending time
         

@@ -349,12 +349,9 @@ async def process_condition_activity(
 
     # New frontend-style single condition evaluation
     if condition_variable and condition_value is not None:
-        logger.info(f"🔧 CONDITION_EVAL: Looking for variable '{condition_variable}' in context: {context.variables}")
         if condition_variable in context.variables:
             actual_value = context.variables[condition_variable]
-            logger.info(f"🔧 CONDITION_EVAL: Found variable '{condition_variable}' = {actual_value}, comparing with {condition_value} using {condition_operator}")
             condition_met = _evaluate_condition(actual_value, condition_operator, condition_value)
-            logger.info(f"🔧 CONDITION_EVAL: Condition result: {condition_met}")
         else:
             logger.warning(f"🔧 CONDITION_EVAL: Variable '{condition_variable}' NOT FOUND in context variables: {list(context.variables.keys())}")
 
@@ -370,7 +367,6 @@ async def process_condition_activity(
 
     # Legacy multi-condition support with frontend action integration
     if not condition_variable and conditions:
-        logger.info(f"🔧 CONDITION_EVAL: Using legacy multi-condition logic with {len(conditions)} conditions")
         for condition in conditions:
             variable = condition.get("variable")
             operator = condition.get("operator")
@@ -378,29 +374,23 @@ async def process_condition_activity(
             action = condition.get("action")
             action_config = condition.get("action_config", {})
 
-            logger.info(f"🔧 CONDITION_EVAL: Checking legacy condition - variable: '{variable}', value: {value}, operator: {operator}")
-            logger.info(f"🔧 CONDITION_EVAL: Available context variables: {list(context.variables.keys())}")
 
             if variable in context.variables:
                 actual_value = context.variables[variable]
-                logger.info(f"🔧 CONDITION_EVAL: Found variable '{variable}' = {actual_value}, comparing with {value} using {operator}")
 
                 # Evaluate condition based on operator
                 if _evaluate_condition(actual_value, operator, value):
-                    logger.info(f"🔧 CONDITION_EVAL: Legacy condition matched! Executing action: {on_true_action}")
                     condition_met = True
                     matching_condition = condition
                     # Use frontend-style action instead of legacy action
                     action_taken = _execute_frontend_condition_action(on_true_action, context)
                     break
                 else:
-                    logger.info(f"🔧 CONDITION_EVAL: Legacy condition not matched")
             else:
                 logger.warning(f"🔧 CONDITION_EVAL: Variable '{variable}' NOT FOUND in context")
 
         # Execute default action if no conditions matched (use on_false_action)
         if not condition_met:
-            logger.info(f"🔧 CONDITION_EVAL: No legacy conditions matched, executing default action: {on_false_action}")
             action_taken = _execute_frontend_condition_action(on_false_action, context)
 
     return ActivityResult(
@@ -670,18 +660,12 @@ def _execute_condition_action(action: str, action_config: Dict[str, Any], contex
 
 def _execute_frontend_condition_action(action: str, context: WorkflowContext) -> str:
     """Execute frontend-style condition actions (on_true/on_false)"""
-    logger.info(f"🔧 CONDITION_ACTION: Executing action '{action}'")
     if action == "continue":
-        logger.info(f"🔧 CONDITION_ACTION: Setting continue action")
         return "Continue to next activity"
     elif action == "skip":
-        logger.info(f"🔧 CONDITION_ACTION: Setting skip_next_activity = True")
         context.variables["skip_next_activity"] = True
-        logger.info(f"🔧 CONDITION_ACTION: Context variables after skip: {context.variables}")
         return "Skip next activity"
     elif action == "stop":
-        logger.info(f"🔧 CONDITION_ACTION: Setting stop_workflow = True")
         context.variables["stop_workflow"] = True
         return "Stop workflow"
-    logger.info(f"🔧 CONDITION_ACTION: Unknown action, returning as-is")
     return f"Executed frontend action: {action}"

@@ -111,13 +111,10 @@ app.add_middleware(
 @app.middleware("http")
 async def cors_debug_middleware(request: Request, call_next):
     if request.method == "OPTIONS":
-        logger.info(f"CORS Preflight: {request.url} from {request.headers.get('origin')}")
-        logger.info(f"Request headers: {dict(request.headers)}")
 
     response = await call_next(request)
 
     if request.method == "OPTIONS":
-        logger.info(f"CORS Response status: {response.status_code}")
 
     return response
 
@@ -184,27 +181,22 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 @app.on_event("startup")
 async def startup_event():
     """Initialize application on startup"""
-    logger.info("Starting meddataflow Platform...")
     
     try:
         # Connect to database
         await connect_database()
-        logger.info("Database connected successfully")
         
         # Test database connection
         if await test_connection():
-            logger.info("Database health check passed")
         else:
             logger.warning("Database health check failed")
         
         # Start queue service
         await queue_service.start()
-        logger.info("Queue service started")
 
         # Ensure settings tables exist
         from services.settings_service import settings_service
         await settings_service.ensure_settings_tables()
-        logger.info("Settings tables ensured")
 
         # Initialize AI settings - admin must configure API key
         ai_settings = await settings_service.get_ai_settings()
@@ -216,11 +208,9 @@ async def startup_event():
                     "enabled": True,
                     "openrouter_api_key": api_key
                 })
-                logger.info("AI settings initialized from environment")
             else:
                 logger.warning("AI API key not configured - admin must set via settings")
 
-        logger.info("Application startup completed")
         
     except Exception as e:
         logger.error(f"Failed to initialize application: {e}")
@@ -229,16 +219,13 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
-    logger.info("Shutting down meddataflow Platform...")
     
     # Stop queue service
     await queue_service.stop()
-    logger.info("Queue service stopped")
     
     # Close database connections
     await disconnect_database()
     
-    logger.info("Shutdown completed")
 
 # Exception handlers
 @app.exception_handler(HTTPException)

@@ -52,13 +52,11 @@ async def process_hl7_parser_activity(activity: Dict[str, Any], context: Workflo
                 if var_name == "MESSAGE_TYPE" and parsed_message:
                     parsed_dict = parsed_message.to_dict()
                     message_type = parsed_dict.get("message_type", "")
-                    logger.info(f"🔧 HL7_PARSER: Extracting MESSAGE_TYPE from metadata: {message_type}")
                     extracted_vars[var_name] = message_type
                     context.variables[var_name] = message_type
                 else:
                     value = _extract_hl7_field_value(context.raw_message, var_source, var_default)
                     # PHI-safe logging - only log field path and success status
-                    logger.info(f"🔧 HL7_PARSER: Extracted {var_name} from {var_source}: {'[VALUE_EXTRACTED]' if value else '[NO_VALUE]'}")
                     extracted_vars[var_name] = value
                     context.variables[var_name] = value
 

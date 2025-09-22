@@ -239,8 +239,6 @@ async def list_workflow_activities(workflow_id: str, current_user: Dict[str, Any
 
 @router.put("/{workflow_id}/activities/{activity_id}", response_model=WorkflowActivity)
 async def update_workflow_activity(workflow_id: str, activity_id: str, activity_data: WorkflowActivityUpdate, current_user: Dict[str, Any] = Depends(get_current_user)):
-    logger.info(f"🔧 UPDATE_ACTIVITY: Starting update for activity {activity_id}")
-    logger.info(f"🔧 UPDATE_ACTIVITY: Received data: {activity_data.dict()}")
 
     workflow_uuid = validate_uuid(workflow_id)
     activity_uuid = validate_uuid(activity_id)
@@ -282,12 +280,9 @@ async def update_workflow_activity(workflow_id: str, activity_id: str, activity_
     query = f"""UPDATE workflow_activities SET {', '.join(update_fields)}
                WHERE id = :id AND workflow_id = :workflow_id RETURNING *"""
 
-    logger.info(f"🔧 UPDATE_ACTIVITY: SQL Query: {query}")
-    logger.info(f"🔧 UPDATE_ACTIVITY: SQL Values: {values}")
 
     try:
         updated_activity = await fetch_one_dict(query, values)
-        logger.info(f"🔧 UPDATE_ACTIVITY: Update successful, returning activity")
     except Exception as e:
         logger.error(f"🔧 UPDATE_ACTIVITY: Database error: {str(e)}")
         raise

@@ -179,46 +179,33 @@ class WorkflowExecutionService:
                     continue
 
                 # Check if this activity should be skipped due to condition action
-                logger.info(f"🔧 WORKFLOW_EXEC: Checking skip flag for activity '{activity['name']}', skip_next_activity = {context.variables.get('skip_next_activity')}")
                 if context.variables.get("skip_next_activity"):
-                    logger.info(f"🔧 WORKFLOW_EXEC: Skipping activity '{activity['name']}' due to condition action")
                     context.variables["skip_next_activity"] = False  # Reset flag
                     continue
 
                 context.current_activity = activity["name"]
-                safe_starting_keys = [k for k in context.variables.keys() if not self._is_phi_field(k)]
-                logger.info(f"🔧 WORKFLOW_EXEC: Starting activity '{activity['name']}' with {len(context.variables)} variables: {safe_starting_keys}")
                 result = await self._execute_activity(activity, context)
 
-                # Update context with results - PHI-safe logging
-                safe_var_keys = [k for k in result.variables.keys() if not self._is_phi_field(k)]
-                logger.info(f"🔧 WORKFLOW_EXEC: Activity '{activity['name']}' returned {len(result.variables)} variables: {safe_var_keys}")
+                # Update context with results
                 context.variables.update(result.variables)
-                safe_context_keys = [k for k in context.variables.keys() if not self._is_phi_field(k)]
-                logger.info(f"🔧 WORKFLOW_EXEC: Context has {len(context.variables)} variables: {safe_context_keys}")
 
                 # Log activity execution
                 self._log_activity_execution(context, activity, result)
 
                 # Check for stop workflow flag from condition activities
                 if context.variables.get("stop_workflow"):
-                    logger.info(f"Stopping workflow due to condition action")
                     break
 
                 # Handle errors based on activity configuration
                 if result.status == ActivityStatus.FAILED:
                     # Check both old and new formats for error handling
                     error_action = activity.get("on_error_action")
-                    logger.info(f"Activity {activity['name']} on_error_action: {error_action}")
 
                     if not error_action:
                         # Check nested error_handling format
                         error_handling = activity.get("error_handling", {})
                         error_action = error_handling.get("on_error", "stop")
-                        logger.info(f"Activity {activity['name']} error_handling: {error_handling}")
-                        logger.info(f"Activity {activity['name']} fallback error_handling.on_error: {error_action}")
 
-                    logger.info(f"Activity {activity['name']} failed with final error action: {error_action}")
 
                     if error_action == "stop":
                         raise Exception(f"Activity {activity['name']} failed: {result.error_message}")
@@ -339,22 +326,9 @@ class WorkflowExecutionService:
         )
 
         try:
-            # Add debugging for HL7 and database activities - PHI-safe logging
-            if activity_type in ['hl7_parser', 'hl7_transformer', 'hl7_to_csv', 'hl7_to_fhir', 'database_write']:
-                logger.info(f"Executing activity: {activity_type}, raw_message present: {bool(context.raw_message)}")
-                if context.raw_message:
-                    logger.info(f"Raw message length: {len(context.raw_message)}")
-                safe_var_keys = [k for k in context.variables.keys() if not self._is_phi_field(k)]
-                logger.info(f"Context variables (PHI-safe): {safe_var_keys}")
 
             result = await processor(activity, context)
 
-            # Add debugging for results - PHI-safe logging
-            if activity_type in ['hl7_parser', 'hl7_transformer', 'hl7_to_csv', 'hl7_to_fhir', 'database_write']:
-                logger.info(f"Activity {activity_type} result: {result.status}, error: {result.error_message}")
-                if result.variables:
-                    safe_result_keys = [k for k in result.variables.keys() if not self._is_phi_field(k)]
-                    logger.info(f"Variables after {activity_type} (PHI-safe): {safe_result_keys}")
 
             end_time = datetime.utcnow()
             result.execution_time_ms = int((end_time - start_time).total_seconds() * 1000)

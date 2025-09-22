@@ -24,7 +24,6 @@ class SecurityTestSuite:
 
     async def run_all_tests(self):
         """Run complete security test suite"""
-        logger.info("🔍 Starting comprehensive security penetration test...")
 
         tests = [
             ("Authentication Security", self.test_authentication_security),
@@ -42,7 +41,6 @@ class SecurityTestSuite:
         ]
 
         for test_name, test_func in tests:
-            logger.info(f"🧪 Running {test_name} tests...")
             try:
                 await test_func()
                 self._record_result(test_name, "PASSED", "All security controls working")

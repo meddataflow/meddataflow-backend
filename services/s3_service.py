@@ -37,13 +37,11 @@ class S3Service:
                 # Try to create bucket if it doesn't exist (for LocalStack)
                 try:
                     self.s3_client.head_bucket(Bucket=self.bucket_name)
-                    logger.info(f"Successfully connected to S3 bucket: {self.bucket_name}")
                 except ClientError as e:
                     error_code = e.response['Error']['Code']
                     if error_code == '404':  # Bucket doesn't exist
                         try:
                             self.s3_client.create_bucket(Bucket=self.bucket_name)
-                            logger.info(f"Created S3 bucket: {self.bucket_name}")
                         except Exception as create_error:
                             logger.warning(f"Could not create bucket {self.bucket_name}: {create_error}")
                     else:
@@ -129,7 +127,6 @@ class S3Service:
                 ExpiresIn=604800  # 7 days
             )
             
-            logger.info(f"Successfully uploaded file {filename} to S3: {s3_key}")
             
             return {
                 'success': True,
@@ -233,7 +230,6 @@ class S3Service:
                 ServerSideEncryption='AES256'  # Encrypt at rest
             )
 
-            logger.info(f"Successfully uploaded content to S3: s3://{bucket}/{key}")
 
             return {
                 'success': True,
@@ -296,7 +292,6 @@ class S3Service:
         
         try:
             self.s3_client.delete_object(Bucket=self.bucket_name, Key=s3_key)
-            logger.info(f"Successfully deleted file from S3: {s3_key}")
             return True
         except ClientError as e:
             logger.error(f"Failed to delete file from S3: {e}")

@@ -114,7 +114,6 @@ async def generate_workflow_from_prompt(
                     # Create transformers if any (optional – storing for parity when table exists)
                     # Note: activity_transformers table in this codebase expects different schema; add when needed.
 
-                logger.info(f"AI-generated workflow created: {workflow_id} for user {current_user['id']}")
 
             except Exception as e:
                 logger.error(f"Failed to auto-create workflow: {e}")
@@ -191,7 +190,6 @@ async def update_ai_settings(
         # Update settings
         await settings_service.update_ai_settings(filtered_settings)
 
-        logger.info(f"AI settings updated by super admin {current_user['id']}")
 
         return {"message": "AI settings updated successfully"}
 

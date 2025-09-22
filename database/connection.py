@@ -29,7 +29,6 @@ async def create_connection_pool():
             max_size=10,
             command_timeout=60
         )
-        logger.info("Database connection pool created")
     except Exception as e:
         logger.error(f"Failed to create connection pool: {e}")
         raise
@@ -40,7 +39,6 @@ async def close_connection_pool():
     if _pool:
         await _pool.close()
         _pool = None
-        logger.info("Database connection pool closed")
 
 async def get_pool() -> asyncpg.Pool:
     """Get database connection pool"""

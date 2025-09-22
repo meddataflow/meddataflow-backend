@@ -90,7 +90,6 @@ class HIPAALogger:
         audit_event["integrity_hash"] = audit_hash
 
         # Log the event
-        self.logger.info(json.dumps(audit_event))
 
         return event_id
 

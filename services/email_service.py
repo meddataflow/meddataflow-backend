@@ -28,7 +28,6 @@ def send_email(to: str, subject: str, body: str, html: str | None = None) -> boo
 
     if not host or not (user and pwd):
         # Fallback: log the email content
-        logger.info(f"[EmailService] To: {to} | Subject: {subject} | Body: {body}")
         return False
 
     try:

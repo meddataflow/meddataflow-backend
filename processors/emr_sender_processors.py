@@ -64,7 +64,6 @@ async def process_ecw_fhir_sender_activity(activity: Dict[str, Any], context: Wo
                 error_message=f"Unsupported operation: {operation}"
             )
 
-        logger.info(f"🏥 ECW_FHIR: Sending {operation} request to {endpoint}")
 
         # Send HTTP request
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
@@ -146,7 +145,6 @@ async def process_nextgen_api_sender_activity(activity: Dict[str, Any], context:
         # Build full URL
         full_url = f"{base_url}{endpoint}"
 
-        logger.info(f"📤 NEXTGEN: Sending {http_method} request to {full_url}")
 
         # Send HTTP request
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
@@ -243,7 +241,6 @@ async def process_cerner_fhir_sender_activity(activity: Dict[str, Any], context:
                 error_message=f"Unsupported operation: {operation}"
             )
 
-        logger.info(f"🔷 CERNER: Sending {operation} request to {endpoint}")
 
         # Send HTTP request
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
@@ -319,7 +316,6 @@ async def process_epic_hl7_sender_activity(activity: Dict[str, Any], context: Wo
             field_mappings
         )
 
-        logger.info(f"📋 EPIC: Sending HL7 {message_type} message to {hl7_endpoint}")
 
         # Send HL7 message (implementation depends on Epic's interface type)
         if hl7_endpoint.startswith("http"):

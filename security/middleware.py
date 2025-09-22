@@ -147,15 +147,6 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
             if hasattr(request.state, 'user') and request.state.user:
                 user_id = request.state.user.get('id')
 
-            logger.info(
-                f"AUDIT_REQUEST: {request_id} | "
-                f"Method: {request.method} | "
-                f"Path: {request.url.path} | "
-                f"IP: {client_ip} | "
-                f"User: {user_id} | "
-                f"UserAgent: {request.headers.get('user-agent', 'Unknown')}"
-            )
-
         # Process request
         try:
             response = await call_next(request)
@@ -163,11 +154,6 @@ class AuditLogMiddleware(BaseHTTPMiddleware):
             # Log response for sensitive endpoints
             if is_sensitive:
                 duration = time.time() - start_time
-                logger.info(
-                    f"AUDIT_RESPONSE: {request_id} | "
-                    f"Status: {response.status_code} | "
-                    f"Duration: {duration:.3f}s"
-                )
 
             # Add request ID to response headers
             response.headers["X-Request-ID"] = request_id

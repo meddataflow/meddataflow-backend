@@ -72,7 +72,6 @@ class VPNManager:
             # Validate inputs before processing
             vpn_config.validate_inputs()
 
-            logger.info(f"Establishing VPN connection for tenant {tenant_id}")
 
             if vpn_config.vpn_type == "openvpn":
                 return await self._connect_openvpn(tenant_id, vpn_config)
@@ -98,7 +97,6 @@ class VPNManager:
                 if process.poll() is None:
                     process.kill()
                 del self.active_connections[tenant_id]
-                logger.info(f"VPN disconnected for tenant {tenant_id}")
             except Exception as e:
                 logger.error(f"Error disconnecting VPN for tenant {tenant_id}: {e}")
 
@@ -162,7 +160,6 @@ verb 3
                     "auth_file": auth_file_path,
                     "type": "openvpn"
                 }
-                logger.info(f"OpenVPN connected for tenant {tenant_id}")
                 return True
             else:
                 # Clean up files
@@ -195,7 +192,6 @@ verb 3
                     "config_file": config_file_path,
                     "type": "wireguard"
                 }
-                logger.info(f"WireGuard connected for tenant {tenant_id}")
                 return True
             else:
                 os.unlink(config_file_path)
@@ -235,7 +231,6 @@ exit 0
                     "script_file": script_path,
                     "type": "cisco_anyconnect"
                 }
-                logger.info(f"Cisco AnyConnect connected for tenant {tenant_id}")
                 return True
             else:
                 os.unlink(script_path)
@@ -296,7 +291,6 @@ async def process_database_write_activity(
     # Establish VPN connection if enabled
     vpn_connected = False
     if vpn_config.enabled:
-        logger.info(f"VPN enabled for database connection, tenant: {context.tenant_id}")
         vpn_connected = await vpn_manager.connect_vpn(context.tenant_id, vpn_config)
         if not vpn_connected:
             return ActivityResult(

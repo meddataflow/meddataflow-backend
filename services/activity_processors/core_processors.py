@@ -46,7 +46,6 @@ class FilterProcessor(ActivityProcessor):
             result = self._evaluate_condition(actual_value, operator, expected_value)
             condition_results.append(result)
 
-            logger.info(f"Filter condition: {variable} {operator} {expected_value} = {result} (actual: {actual_value})")
 
         # Apply logical operator
         if logical_operator == "AND":
