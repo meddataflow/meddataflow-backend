@@ -209,12 +209,35 @@ async def process_s3_storage_activity(
 
     encryption = config.get("encryption", True)
 
-    # Get content to store - try multiple sources
-    csv_content = context.variables.get("csv_content")
-    csv_filename = context.variables.get("csv_filename", f"data_{uuid.uuid4().hex}.csv")
+    # Get AWS credentials from activity config (overrides environment)
+    aws_config = config.get("aws", {})
+    aws_access_key = aws_config.get("access_key_id")
+    aws_secret_key = aws_config.get("secret_access_key")
+    aws_region = aws_config.get("region", "us-east-1")
 
-    # If no CSV content, try to create JSON content from available variables
-    if not csv_content:
+    logger.info(f"S3 Storage Debug - AWS config: {aws_config}")
+    logger.info(f"S3 Storage Debug - Has credentials: access_key={bool(aws_access_key)}, secret_key={bool(aws_secret_key)}")
+
+    # Get content to store based on configuration
+    content_types = config.get("content", ["variables"])  # Default to variables if not specified
+
+    csv_content = None
+    csv_filename = None
+    content_type = "application/json"  # Default content type
+
+    # Check what type of content to store
+    if "raw_message" in content_types and hasattr(context, 'raw_message') and context.raw_message:
+        # Store raw HL7 message
+        csv_content = context.raw_message
+        csv_filename = f"hl7_message_{uuid.uuid4().hex[:8]}.hl7"
+        content_type = "text/plain"
+    elif "csv_content" in content_types and context.variables.get("csv_content"):
+        # Store CSV content
+        csv_content = context.variables.get("csv_content")
+        csv_filename = context.variables.get("csv_filename", f"data_{uuid.uuid4().hex[:8]}.csv")
+        content_type = "text/csv"
+    else:
+        # Default: create JSON content from available variables
         # Create JSON content from available variables (excluding system variables)
         system_vars = {"source", "metadata", "trigger_type", "message"}
         data_vars = {k: v for k, v in context.variables.items()
@@ -224,7 +247,6 @@ async def process_s3_storage_activity(
 
         if data_vars:
             import json
-            from datetime import datetime
 
             # Custom JSON encoder to handle UUID and other non-serializable objects
             def json_serializer(obj):
@@ -258,6 +280,18 @@ async def process_s3_storage_activity(
         **context.variables  # Include all variables for substitution
     }
 
+    # Add common defaults for variables that might not be extracted
+    if "patient_id" not in substitutions:
+        substitutions["patient_id"] = "unknown_patient"
+    if "file_extension" not in substitutions:
+        # Set extension based on content type
+        if content_type == "text/plain":
+            substitutions["file_extension"] = "hl7"
+        elif content_type == "text/csv":
+            substitutions["file_extension"] = "csv"
+        else:
+            substitutions["file_extension"] = "json"
+
     # Replace both {{var}} and {var} patterns
     for var_name, var_value in substitutions.items():
         double_placeholder = f"{{{{{var_name}}}}}"
@@ -266,20 +300,51 @@ async def process_s3_storage_activity(
         s3_key = s3_key.replace(single_placeholder, str(var_value))
 
     try:
-        # Upload to S3
-        result = await s3_service.upload_content(
-            bucket=bucket,
-            key=s3_key,
-            content=csv_content,
-            content_type="text/csv",
-            metadata={
-                "workflow_id": str(context.workflow_id),
-                "execution_id": str(context.execution_id),
-                "tenant_id": str(context.tenant_id),
-                "message_type": context.variables.get("MESSAGE_TYPE", ""),
-                "processed_at": datetime.utcnow().isoformat()
-            }
-        )
+        # Create S3 client with credentials from config if provided, otherwise use global service
+        if aws_access_key and aws_secret_key:
+            import boto3
+            from botocore.exceptions import ClientError, NoCredentialsError
+
+            # Create custom S3 client with config credentials
+            s3_client = boto3.client(
+                's3',
+                aws_access_key_id=aws_access_key,
+                aws_secret_access_key=aws_secret_key,
+                region_name=aws_region
+            )
+
+            # Upload directly using boto3 client
+            s3_client.put_object(
+                Bucket=bucket,
+                Key=s3_key,
+                Body=csv_content.encode('utf-8'),
+                ContentType=content_type,
+                Metadata={
+                    "workflow_id": str(context.workflow_id),
+                    "execution_id": str(context.execution_id),
+                    "tenant_id": str(context.tenant_id),
+                    "message_type": context.variables.get("MESSAGE_TYPE", ""),
+                    "processed_at": datetime.utcnow().isoformat()
+                },
+                ServerSideEncryption='AES256'
+            )
+
+            logger.info(f"Successfully uploaded to S3: {bucket}/{s3_key}")
+        else:
+            # Fallback to global s3_service (uses environment variables)
+            result = await s3_service.upload_content(
+                bucket=bucket,
+                key=s3_key,
+                content=csv_content,
+                content_type=content_type,
+                metadata={
+                    "workflow_id": str(context.workflow_id),
+                    "execution_id": str(context.execution_id),
+                    "tenant_id": str(context.tenant_id),
+                    "message_type": context.variables.get("MESSAGE_TYPE", ""),
+                    "processed_at": datetime.utcnow().isoformat()
+                }
+            )
 
         return ActivityResult(
             status=ActivityStatus.COMPLETED,

@@ -10,45 +10,26 @@ logger = logging.getLogger(__name__)
 
 class S3Service:
     def __init__(self):
-        self.aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID', 'test')
-        self.aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY', 'test')
+        self.aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
+        self.aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
         self.aws_region = os.getenv('AWS_DEFAULT_REGION', 'us-east-1')
-        self.bucket_name = os.getenv('S3_BUCKET_NAME', 'hl7-test-bucket')
-        self.endpoint_url = os.getenv('AWS_ENDPOINT_URL')  # For LocalStack
+        self.bucket_name = os.getenv('S3_BUCKET_NAME', 'hl7-processed-files')
 
-        # For LocalStack testing, use default test credentials
-        if not self.endpoint_url and not all([self.aws_access_key_id, self.aws_secret_access_key]):
-            logger.warning("S3 configuration incomplete. Some features may not work.")
+        # Only initialize if we have actual credentials
+        if not all([self.aws_access_key_id, self.aws_secret_access_key]):
+            logger.info("S3 service initialized without credentials - will use activity-specific config when available")
             self.s3_client = None
         else:
             try:
-                client_config = {
-                    'aws_access_key_id': self.aws_access_key_id,
-                    'aws_secret_access_key': self.aws_secret_access_key,
-                    'region_name': self.aws_region
-                }
-
-                # Add endpoint URL for LocalStack
-                if self.endpoint_url:
-                    client_config['endpoint_url'] = self.endpoint_url
-
-                self.s3_client = boto3.client('s3', **client_config)
-
-                # Try to create bucket if it doesn't exist (for LocalStack)
-                try:
-                    self.s3_client.head_bucket(Bucket=self.bucket_name)
-                except ClientError as e:
-                    error_code = e.response['Error']['Code']
-                    if error_code == '404':  # Bucket doesn't exist
-                        try:
-                            self.s3_client.create_bucket(Bucket=self.bucket_name)
-                        except Exception as create_error:
-                            logger.warning(f"Could not create bucket {self.bucket_name}: {create_error}")
-                    else:
-                        raise e
-
+                self.s3_client = boto3.client(
+                    's3',
+                    aws_access_key_id=self.aws_access_key_id,
+                    aws_secret_access_key=self.aws_secret_access_key,
+                    region_name=self.aws_region
+                )
+                logger.info("S3 service initialized with environment credentials")
             except Exception as e:
-                logger.error(f"Failed to connect to S3: {e}")
+                logger.error(f"Failed to initialize S3 client: {e}")
                 self.s3_client = None
     
     def is_available(self) -> bool:
