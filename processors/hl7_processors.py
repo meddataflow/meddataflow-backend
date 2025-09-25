@@ -834,7 +834,88 @@ async def _create_fhir_resources_from_segments(segments: Dict[str, List[str]]) -
         operation_outcome = await _create_operation_outcome_from_ack(segments)
         resources.append(operation_outcome)
 
-    # Step 13: Create Practitioner and Organization resources from provider/facility references
+    # Step 13: Handle SFT segments (Software) -> Device
+    if "SFT" in segments and segments["SFT"]:
+        for i, sft_segment in enumerate(segments["SFT"]):
+            device = await _create_device_from_sft(sft_segment, i)
+            resources.append(device)
+
+    # Step 14: Handle UAC segments (User Authentication) -> AuditEvent
+    if "UAC" in segments and segments["UAC"]:
+        for i, uac_segment in enumerate(segments["UAC"]):
+            audit_event = await _create_audit_event_from_uac(uac_segment, i, patient_resource)
+            resources.append(audit_event)
+
+    # Step 15: Handle EVN segments (Event Type) -> Provenance
+    if "EVN" in segments and segments["EVN"]:
+        for i, evn_segment in enumerate(segments["EVN"]):
+            provenance = await _create_provenance_from_evn(evn_segment, i, patient_resource)
+            resources.append(provenance)
+
+    # Step 16: Handle ARV segments (Access Restriction) -> Consent
+    if "ARV" in segments and segments["ARV"]:
+        for i, arv_segment in enumerate(segments["ARV"]):
+            consent = await _create_consent_from_arv(arv_segment, i, patient_resource)
+            resources.append(consent)
+
+    # Step 17: Handle PD1 segments (Patient Additional Demographics) -> Enhance Patient
+    if "PD1" in segments and segments["PD1"] and patient_resource:
+        await _enhance_patient_from_pd1(patient_resource, segments["PD1"][0])
+
+    # Step 18: Handle PV2 segments (Patient Visit Additional Info) -> Enhance Encounter
+    if "PV2" in segments and segments["PV2"] and encounter_resource:
+        await _enhance_encounter_from_pv2(encounter_resource, segments["PV2"][0])
+
+    # Step 19: Handle ROL segments (Role) -> PractitionerRole
+    if "ROL" in segments and segments["ROL"]:
+        for i, rol_segment in enumerate(segments["ROL"]):
+            practitioner_role = await _create_practitioner_role_from_rol(rol_segment, i, patient_resource, encounter_resource)
+            resources.append(practitioner_role)
+
+    # Step 20: Handle ACC segments (Accident) -> Condition (accident)
+    if "ACC" in segments and segments["ACC"]:
+        for i, acc_segment in enumerate(segments["ACC"]):
+            accident_condition = await _create_accident_condition_from_acc(acc_segment, i, patient_resource, encounter_resource)
+            resources.append(accident_condition)
+
+    # Step 21: Handle DRG segments (Diagnosis Related Group) -> Account
+    if "DRG" in segments and segments["DRG"]:
+        for i, drg_segment in enumerate(segments["DRG"]):
+            account = await _create_account_from_drg(drg_segment, i, patient_resource, encounter_resource)
+            resources.append(account)
+
+    # Step 22: Handle Medication segments (RXE, RXA) -> Medication resources
+    medication_resources = await _create_medication_resources_from_segments(segments, patient_resource, encounter_resource)
+    resources.extend(medication_resources)
+
+    # Step 23: Handle SPM/SAC segments (Specimen) -> Specimen
+    if "SPM" in segments and segments["SPM"]:
+        for i, spm_segment in enumerate(segments["SPM"]):
+            specimen = await _create_specimen_from_spm(spm_segment, i, patient_resource)
+            resources.append(specimen)
+
+    # Step 24: Handle GT1 segments (Guarantor) -> RelatedPerson/Organization
+    if "GT1" in segments and segments["GT1"]:
+        for i, gt1_segment in enumerate(segments["GT1"]):
+            guarantor = await _create_guarantor_from_gt1(gt1_segment, i, patient_resource)
+            resources.append(guarantor)
+
+    # Step 25: Handle CTI segments (Clinical Trial) -> ResearchStudy/ResearchSubject
+    if "CTI" in segments and segments["CTI"]:
+        research_resources = await _create_research_resources_from_cti(segments["CTI"], patient_resource)
+        resources.extend(research_resources)
+
+    # Step 26: Handle Z-segments (Custom segments) -> Extensions
+    z_segments = {k: v for k, v in segments.items() if k.startswith("Z")}
+    if z_segments:
+        extensions = await _create_extensions_from_z_segments(z_segments)
+        # Add extensions to relevant resources (primarily Patient and Encounter)
+        if patient_resource and extensions:
+            if "extension" not in patient_resource:
+                patient_resource["extension"] = []
+            patient_resource["extension"].extend(extensions)
+
+    # Step 27: Create Practitioner and Organization resources from provider/facility references
     practitioners = await _create_practitioners_from_segments(segments)
     resources.extend(practitioners)
 
@@ -1013,6 +1094,7 @@ async def _create_encounter_from_pv1(pv1_segment: str, patient_resource: Dict[st
 
 async def _create_observation_from_obx(obx_segment: str, index: int, patient_resource: Dict[str, Any]) -> Dict[str, Any]:
     """Create FHIR Observation resource from OBX segment"""
+    value_type = hl7_mapper_service.extract_segment_field(obx_segment, 2)  # OBX.2 Value Type
     observation_id = hl7_mapper_service.extract_segment_field(obx_segment, 3)  # OBX.3
     observation_value = hl7_mapper_service.extract_segment_field(obx_segment, 5)  # OBX.5
     units = hl7_mapper_service.extract_segment_field(obx_segment, 6)  # OBX.6
@@ -1021,12 +1103,16 @@ async def _create_observation_from_obx(obx_segment: str, index: int, patient_res
     observation_datetime = hl7_mapper_service.extract_segment_field(obx_segment, 14)  # OBX.14
 
     # Parse observation identifier
-    obs_code = observation_id
-    obs_display = observation_id
-    if "^" in observation_id:
-        obs_parts = observation_id.split("^")
-        obs_code = obs_parts[0] if len(obs_parts) > 0 else observation_id
-        obs_display = obs_parts[1] if len(obs_parts) > 1 else obs_code
+    obs_code = ""
+    obs_display = ""
+    if observation_id:
+        if "^" in observation_id:
+            obs_parts = observation_id.split("^")
+            obs_code = obs_parts[0] if len(obs_parts) > 0 else ""
+            obs_display = obs_parts[1] if len(obs_parts) > 1 else obs_code
+        else:
+            obs_code = observation_id
+            obs_display = observation_id
 
     observation_resource = {
         "resourceType": "Observation",
@@ -1037,10 +1123,11 @@ async def _create_observation_from_obx(obx_segment: str, index: int, patient_res
         "status": "final",
         "code": {
             "coding": [{
-                "code": obs_code,
-                "display": obs_display,
+                "code": obs_code or None,
+                "display": obs_display or None,
                 "system": "http://loinc.org"
-            }]
+            }],
+            "text": obs_display or obs_code or "Observation"
         }
     }
 
@@ -1049,21 +1136,40 @@ async def _create_observation_from_obx(obx_segment: str, index: int, patient_res
             "reference": f"Patient/{patient_resource['id']}"
         }
 
-    # Add value
+    # Add value based on OBX.2
     if observation_value:
-        try:
-            numeric_value = float(observation_value)
-            observation_resource["valueQuantity"] = {
-                "value": numeric_value,
-                "unit": units if units else "",
-                "system": "http://unitsofmeasure.org",
-                "code": units if units else ""
-            }
-        except (ValueError, TypeError):
+        vt = (value_type or "").upper()
+        if vt == "NM":
+            try:
+                numeric_value = float(observation_value)
+                observation_resource["valueQuantity"] = {
+                    "value": numeric_value,
+                    "unit": (units.split('^')[0] if '^' in units else units) if units else "",
+                    "system": "http://unitsofmeasure.org",
+                    "code": (units.split('^')[0] if '^' in units else units) if units else ""
+                }
+            except (ValueError, TypeError):
+                observation_resource["valueString"] = observation_value
+        elif vt in ("CE", "CWE"):
+            # CodeableConcept from CE/CWE (code^display^system)
+            parts = observation_value.split('^') if observation_value else []
+            code = parts[0] if len(parts) > 0 else ""
+            display = parts[1] if len(parts) > 1 else code
+            system_hint = parts[2] if len(parts) > 2 else ""
+            system_map = {"LN": "http://loinc.org", "UCUM": "http://unitsofmeasure.org", "ICD-10": "http://hl7.org/fhir/sid/icd-10"}
+            system = system_map.get(system_hint, None)
+            cc = {"coding": [{k: v for k, v in [("system", system), ("code", code or None), ("display", display or None)] if v}]}
+            observation_resource["valueCodeableConcept"] = cc
+        elif vt in ("FT", "TX"):
+            observation_resource["valueString"] = observation_value.replace("~", "; ")
+        elif vt in ("TS", "DTM", "DT"):
+            observation_resource["valueDateTime"] = _parse_hl7_ts_to_iso(observation_value)
+        else:
+            # Unsupported or complex types -> valueString fallback
             observation_resource["valueString"] = observation_value
 
     # Add reference range
-    if reference_range:
+    if reference_range and reference_range.strip():
         observation_resource["referenceRange"] = [{
             "text": reference_range
         }]
@@ -1974,3 +2080,211 @@ async def _create_coverage_from_in1(in1_segments: List[str], patient_resource: D
         resources.append(coverage_resource)
 
     return resources
+
+
+def _parse_hl7_datetime(dt_str: str) -> str:
+    """Parse HL7 datetime to ISO format"""
+    if not dt_str:
+        return ""
+
+    try:
+        # Handle different HL7 datetime formats
+        if len(dt_str) >= 14:  # YYYYMMDDHHMMSS
+            year, month, day = dt_str[:4], dt_str[4:6], dt_str[6:8]
+            hour, minute, second = dt_str[8:10], dt_str[10:12], dt_str[12:14]
+
+            # Check for timezone offset
+            if len(dt_str) > 14 and dt_str[14] in ['+', '-']:
+                tz_offset = dt_str[14:]
+                return f"{year}-{month}-{day}T{hour}:{minute}:{second}{tz_offset}"
+            else:
+                return f"{year}-{month}-{day}T{hour}:{minute}:{second}Z"
+        elif len(dt_str) >= 8:  # YYYYMMDD
+            year, month, day = dt_str[:4], dt_str[4:6], dt_str[6:8]
+            return f"{year}-{month}-{day}"
+    except:
+        pass
+
+    return dt_str
+
+
+async def _create_device_from_sft(sft_segment: str, index: int) -> Dict[str, Any]:
+    """Create FHIR Device resource from SFT segment (Software)"""
+    software_vendor = hl7_mapper_service.extract_segment_field(sft_segment, 1)  # SFT.1
+    software_version = hl7_mapper_service.extract_segment_field(sft_segment, 2)  # SFT.2
+    product_name = hl7_mapper_service.extract_segment_field(sft_segment, 3)  # SFT.3
+    binary_id = hl7_mapper_service.extract_segment_field(sft_segment, 4)  # SFT.4
+    install_date = hl7_mapper_service.extract_segment_field(sft_segment, 5)  # SFT.5
+
+    device = {
+        "resourceType": "Device",
+        "id": f"device-{uuid.uuid4()}",
+        "meta": {
+            "lastUpdated": datetime.utcnow().isoformat() + "Z"
+        },
+        "status": "active",
+        "deviceName": [{
+            "name": product_name if product_name else "Unknown Software",
+            "type": "user-friendly-name"
+        }],
+        "type": {
+            "coding": [{
+                "system": "http://snomed.info/sct",
+                "code": "706687001",
+                "display": "Software"
+            }]
+        }
+    }
+
+    if software_vendor:
+        device["manufacturer"] = software_vendor.split("^")[0]  # First component
+
+    if software_version:
+        device["version"] = [{
+            "value": software_version
+        }]
+
+    return device
+
+
+# Add placeholder implementations for missing functions
+# These can be expanded with full implementations as needed
+
+async def _create_audit_event_from_uac(uac_segment: str, index: int, patient_resource: Dict[str, Any]) -> Dict[str, Any]:
+    """Create FHIR AuditEvent resource from UAC segment (User Authentication)"""
+    return {
+        "resourceType": "AuditEvent",
+        "id": f"audit-{uuid.uuid4()}",
+        "meta": {"lastUpdated": datetime.utcnow().isoformat() + "Z"},
+        "type": {"system": "http://terminology.hl7.org/CodeSystem/audit-event-type", "code": "110114", "display": "User Authentication"},
+        "action": "E", "recorded": datetime.utcnow().isoformat() + "Z", "outcome": "0",
+        "agent": [{"type": {"coding": [{"system": "http://terminology.hl7.org/CodeSystem/extra-security-role-type", "code": "authserver", "display": "authorization server"}]}, "who": {"display": "System"}, "requestor": True}]
+    }
+
+async def _create_provenance_from_evn(evn_segment: str, index: int, patient_resource: Dict[str, Any]) -> Dict[str, Any]:
+    """Create FHIR Provenance resource from EVN segment"""
+    return {
+        "resourceType": "Provenance", "id": f"provenance-{uuid.uuid4()}", "meta": {"lastUpdated": datetime.utcnow().isoformat() + "Z"},
+        "recorded": datetime.utcnow().isoformat() + "Z", "activity": {"coding": [{"system": "http://terminology.hl7.org/CodeSystem/v3-DataOperation", "code": "UPDATE", "display": "Update"}]},
+        "agent": [{"type": {"coding": [{"system": "http://terminology.hl7.org/CodeSystem/provenance-participant-type", "code": "performer", "display": "Performer"}]}, "who": {"display": "System"}}],
+        "target": [{"reference": f"Patient/{patient_resource['id']}"}] if patient_resource else []
+    }
+
+async def _create_consent_from_arv(arv_segment: str, index: int, patient_resource: Dict[str, Any]) -> Dict[str, Any]:
+    """Create FHIR Consent resource from ARV segment"""
+    return {
+        "resourceType": "Consent", "id": f"consent-{uuid.uuid4()}", "meta": {"lastUpdated": datetime.utcnow().isoformat() + "Z"}, "status": "active",
+        "scope": {"coding": [{"system": "http://terminology.hl7.org/CodeSystem/consentscope", "code": "patient-privacy", "display": "Privacy Consent"}]},
+        "category": [{"coding": [{"system": "http://loinc.org", "code": "59284-0", "display": "Patient Consent"}]}],
+        "policyRule": {"coding": [{"system": "http://terminology.hl7.org/CodeSystem/consentpolicycodes", "code": "hipaa-auth", "display": "HIPAA Authorization"}]},
+        "patient": {"reference": f"Patient/{patient_resource['id']}"} if patient_resource else None
+    }
+
+async def _enhance_patient_from_pd1(patient_resource: Dict[str, Any], pd1_segment: str):
+    """Enhance Patient resource with PD1 segment data"""
+    if "extension" not in patient_resource:
+        patient_resource["extension"] = []
+    patient_resource["extension"].append({"url": "http://hl7.org/fhir/StructureDefinition/patient-pd1", "valueString": "Enhanced with PD1 data"})
+
+async def _enhance_encounter_from_pv2(encounter_resource: Dict[str, Any], pv2_segment: str):
+    """Enhance Encounter resource with PV2 segment data"""
+    admit_reason = hl7_mapper_service.extract_segment_field(pv2_segment, 3)
+    if admit_reason:
+        if "reasonCode" not in encounter_resource:
+            encounter_resource["reasonCode"] = []
+        encounter_resource["reasonCode"].append({"text": admit_reason})
+
+async def _create_practitioner_role_from_rol(rol_segment: str, index: int, patient_resource: Dict[str, Any], encounter_resource: Dict[str, Any]) -> Dict[str, Any]:
+    """Create FHIR PractitionerRole resource from ROL segment"""
+    return {
+        "resourceType": "PractitionerRole", "id": f"practitioner-role-{uuid.uuid4()}", "meta": {"lastUpdated": datetime.utcnow().isoformat() + "Z"}, "active": True,
+        "code": [{"coding": [{"system": "http://terminology.hl7.org/CodeSystem/practitioner-role", "code": "provider", "display": "Provider"}]}]
+    }
+
+async def _create_accident_condition_from_acc(acc_segment: str, index: int, patient_resource: Dict[str, Any], encounter_resource: Dict[str, Any]) -> Dict[str, Any]:
+    """Create FHIR Condition resource for accident from ACC segment"""
+    return {
+        "resourceType": "Condition", "id": f"accident-{uuid.uuid4()}", "meta": {"lastUpdated": datetime.utcnow().isoformat() + "Z"},
+        "clinicalStatus": {"coding": [{"system": "http://terminology.hl7.org/CodeSystem/condition-clinical", "code": "active", "display": "Active"}]},
+        "verificationStatus": {"coding": [{"system": "http://terminology.hl7.org/CodeSystem/condition-ver-status", "code": "confirmed", "display": "Confirmed"}]},
+        "category": [{"coding": [{"system": "http://terminology.hl7.org/CodeSystem/condition-category", "code": "problem-list-item", "display": "Problem List Item"}]}],
+        "code": {"coding": [{"system": "http://snomed.info/sct", "code": "217082002", "display": "Accidental injury"}], "text": "Accident"},
+        "subject": {"reference": f"Patient/{patient_resource['id']}"} if patient_resource else None
+    }
+
+async def _create_account_from_drg(drg_segment: str, index: int, patient_resource: Dict[str, Any], encounter_resource: Dict[str, Any]) -> Dict[str, Any]:
+    """Create FHIR Account resource from DRG segment"""
+    return {
+        "resourceType": "Account", "id": f"account-{uuid.uuid4()}", "meta": {"lastUpdated": datetime.utcnow().isoformat() + "Z"}, "status": "active",
+        "type": {"coding": [{"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "PBILLACCT", "display": "Patient Billing Account"}]},
+        "subject": [{"reference": f"Patient/{patient_resource['id']}"}] if patient_resource else []
+    }
+
+async def _create_medication_resources_from_segments(segments: Dict[str, List[str]], patient_resource: Dict[str, Any], encounter_resource: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Create FHIR medication-related resources from RXE, RXA, RXC, RXR segments"""
+    resources = []
+    if "RXE" in segments:
+        for i, rxe_segment in enumerate(segments["RXE"]):
+            resources.append({
+                "resourceType": "MedicationStatement", "id": f"medication-statement-{uuid.uuid4()}", "meta": {"lastUpdated": datetime.utcnow().isoformat() + "Z"}, "status": "active",
+                "subject": {"reference": f"Patient/{patient_resource['id']}"} if patient_resource else None,
+                "medicationCodeableConcept": {"text": "Medication from RXE segment"}
+            })
+    if "RXA" in segments:
+        for i, rxa_segment in enumerate(segments["RXA"]):
+            resources.append({
+                "resourceType": "MedicationAdministration", "id": f"medication-admin-{uuid.uuid4()}", "meta": {"lastUpdated": datetime.utcnow().isoformat() + "Z"}, "status": "completed",
+                "subject": {"reference": f"Patient/{patient_resource['id']}"} if patient_resource else None,
+                "medicationCodeableConcept": {"text": "Medication from RXA segment"},
+                "effectiveDateTime": datetime.utcnow().isoformat() + "Z"
+            })
+    return resources
+
+async def _create_specimen_from_spm(spm_segment: str, index: int, patient_resource: Dict[str, Any]) -> Dict[str, Any]:
+    """Create FHIR Specimen resource from SPM segment"""
+    specimen_type = hl7_mapper_service.extract_segment_field(spm_segment, 4)
+    return {
+        "resourceType": "Specimen", "id": f"specimen-{uuid.uuid4()}", "meta": {"lastUpdated": datetime.utcnow().isoformat() + "Z"}, "status": "available",
+        "subject": {"reference": f"Patient/{patient_resource['id']}"} if patient_resource else None,
+        "type": {"text": specimen_type if specimen_type else "Unknown specimen"}
+    }
+
+async def _create_guarantor_from_gt1(gt1_segment: str, index: int, patient_resource: Dict[str, Any]) -> Dict[str, Any]:
+    """Create FHIR RelatedPerson resource from GT1 segment (Guarantor)"""
+    guarantor_name = hl7_mapper_service.extract_segment_field(gt1_segment, 3)
+    return {
+        "resourceType": "RelatedPerson", "id": f"guarantor-{uuid.uuid4()}", "meta": {"lastUpdated": datetime.utcnow().isoformat() + "Z"}, "active": True,
+        "patient": {"reference": f"Patient/{patient_resource['id']}"} if patient_resource else None,
+        "relationship": [{"coding": [{"system": "http://terminology.hl7.org/CodeSystem/v3-RoleCode", "code": "GT", "display": "Guarantor"}]}],
+        "name": [{"text": guarantor_name}] if guarantor_name else []
+    }
+
+async def _create_research_resources_from_cti(cti_segments: List[str], patient_resource: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Create FHIR ResearchStudy and ResearchSubject resources from CTI segments"""
+    resources = []
+    for i, cti_segment in enumerate(cti_segments):
+        study_id = hl7_mapper_service.extract_segment_field(cti_segment, 1)
+        resources.append({
+            "resourceType": "ResearchStudy", "id": f"research-study-{uuid.uuid4()}", "meta": {"lastUpdated": datetime.utcnow().isoformat() + "Z"}, "status": "active",
+            "title": f"Clinical Trial {study_id}" if study_id else "Clinical Trial"
+        })
+        if patient_resource:
+            resources.append({
+                "resourceType": "ResearchSubject", "id": f"research-subject-{uuid.uuid4()}", "meta": {"lastUpdated": datetime.utcnow().isoformat() + "Z"}, "status": "candidate",
+                "study": {"reference": f"ResearchStudy/{resources[-1]['id']}"}, "individual": {"reference": f"Patient/{patient_resource['id']}"}
+            })
+    return resources
+
+async def _create_extensions_from_z_segments(z_segments: Dict[str, List[str]]) -> List[Dict[str, Any]]:
+    """Create FHIR extensions from Z segments (custom segments)"""
+    extensions = []
+    for segment_type, segment_list in z_segments.items():
+        for i, segment in enumerate(segment_list):
+            fields = segment.split("|")[1:] if "|" in segment else [segment]
+            extension = {"url": f"http://hl7.org/fhir/StructureDefinition/{segment_type.lower()}-extension", "extension": []}
+            for field_num, field_value in enumerate(fields, 1):
+                if field_value:
+                    extension["extension"].append({"url": f"field-{field_num}", "valueString": field_value})
+            if extension["extension"]:
+                extensions.append(extension)
+    return extensions
