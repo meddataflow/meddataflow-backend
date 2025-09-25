@@ -58,7 +58,7 @@ class HL7MapperService:
 
         return segments
 
-    def extract_segment_field(self, segment: str, field_number: int, component: int = 0) -> str:
+    def extract_segment_field(self, segment: str, field_number: int, component: Optional[int] = 0) -> str:
         """
         Extract field from HL7 segment with component support.
 
@@ -97,15 +97,19 @@ class HL7MapperService:
                 field_value = fields[field_number]
 
             # Handle component extraction
-            if component > 0 and '^' in field_value:
+            # component semantics:
+            # - None => return entire field
+            # - 0 => first component
+            # - 1..n => subsequent components
+            if component is None:
+                return field_value
+            if '^' in field_value:
                 components = field_value.split('^')
-                if component < len(components):
+                if 0 <= component < len(components):
                     return components[component]
                 return ''
-            elif component == 0:
-                return field_value
-            else:
-                return ''
+            # No component separator present
+            return field_value if component == 0 else ''
 
         except (IndexError, ValueError, AttributeError):
             return ''
@@ -165,7 +169,10 @@ class HL7MapperService:
                 target_parts = target.split('.')
                 target_segment = target_parts[0]
                 target_field = int(target_parts[1]) if len(target_parts) > 1 else 1
-                target_component = int(target_parts[2]) if len(target_parts) > 2 else 0
+                # Components in paths are 1-based; convert to 0-based. If not provided, None => set whole field
+                target_component = (int(target_parts[2]) - 1) if len(target_parts) > 2 else None
+                if isinstance(target_component, int) and target_component < 0:
+                    target_component = 0
 
                 # Get the value to map
                 if value:
@@ -223,7 +230,10 @@ class HL7MapperService:
             parts = field_path.split('.')
             segment_name = parts[0]
             field_number = int(parts[1]) if len(parts) > 1 else 1
-            component = int(parts[2]) if len(parts) > 2 else 0
+            # Interpret component in path as 1-based (HL7 convention), convert to 0-based for extractor
+            component = (int(parts[2]) - 1) if len(parts) > 2 else 0
+            if component < 0:
+                component = 0
 
             if segment_name in segments and segments[segment_name]:
                 segment = segments[segment_name][0]  # Use first occurrence
@@ -233,7 +243,7 @@ class HL7MapperService:
         except (ValueError, IndexError, KeyError):
             return ''
 
-    def _set_field_in_segment(self, segment: str, field_number: int, component: int, value: str) -> str:
+    def _set_field_in_segment(self, segment: str, field_number: int, component: Optional[int], value: str) -> str:
         """
         Set field value in HL7 segment, creating fields as needed.
 
@@ -260,17 +270,16 @@ class HL7MapperService:
                 fields.append('')
 
             # Handle component setting
-            if component > 0:
-                # Split existing components and ensure we have enough
+            if component is None:
+                # Set entire field value
+                fields[target_index] = value
+            else:
+                # Set specific component (0-based)
                 components = fields[target_index].split('^') if fields[target_index] else ['']
                 while len(components) <= component:
                     components.append('')
-
                 components[component] = value
                 fields[target_index] = '^'.join(components)
-            else:
-                # Set entire field
-                fields[target_index] = value
 
             return '|'.join(fields)
 

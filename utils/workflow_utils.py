@@ -142,7 +142,8 @@ def extract_hl7_field_value(hl7_message: str, field_path: str, default: str = ""
             parts = field_path.split('.')
             segment_name = parts[0]
             field_number = int(parts[1]) if len(parts) > 1 else 1
-            component = int(parts[2]) if len(parts) > 2 else 0
+            # Convert HL7 1-based component to 0-based; if not provided, keep None to return full field
+            component = (int(parts[2]) - 1) if len(parts) > 2 else None
 
             if segment_name in segments and segments[segment_name]:
                 segment = segments[segment_name][0]  # Use first occurrence

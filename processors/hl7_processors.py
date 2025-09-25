@@ -9,6 +9,7 @@ import base64
 import logging
 from typing import Dict, List, Optional, Any
 from datetime import datetime
+from typing import Tuple
 
 from models.workflow_models import WorkflowContext, ActivityResult, ActivityStatus
 from services.hl7_parser import HL7Parser, ParsedHL7Message
@@ -105,10 +106,49 @@ async def process_hl7_transformer_activity(activity: Dict[str, Any], context: Wo
         # Store original message before transformation
         original_message = context.raw_message
 
+        # Normalize mappings to internal list format
+        mappings_list = []
+        if isinstance(transformation_mappings, dict):
+            # Support shorthand mapping: { "ZPX.1.1": "SCH.6.1" } or { "ZPX.1": {"value": "OFFICE"} }
+            for target_path, spec in transformation_mappings.items():
+                if isinstance(spec, dict):
+                    mapping_item = {"target": target_path}
+                    if "source" in spec:
+                        mapping_item["source"] = spec["source"]
+                    if "value" in spec:
+                        mapping_item["value"] = spec["value"]
+                    if "transform" in spec:
+                        mapping_item["transform"] = spec["transform"]
+                    mappings_list.append(mapping_item)
+                elif isinstance(spec, str):
+                    # If spec looks like a field path (has a dot), treat as source; otherwise as a literal value
+                    if "." in spec:
+                        mappings_list.append({"target": target_path, "source": spec})
+                    else:
+                        mappings_list.append({"target": target_path, "value": spec})
+        elif isinstance(transformation_mappings, list):
+            mappings_list = transformation_mappings
+        else:
+            mappings_list = []
+
+        # Resolve template variables in hardcoded values like "{{var}}"
+        import re
+        var_pattern = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
+
+        def _interpolate(value: str) -> str:
+            if not isinstance(value, str):
+                return value
+            def _repl(m):
+                key = m.group(1)
+                return str(context.variables.get(key, ""))
+            return var_pattern.sub(_repl, value)
+
+        for m in mappings_list:
+            if isinstance(m, dict) and 'value' in m:
+                m['value'] = _interpolate(m.get('value', ''))
+
         # Use hl7_mapper_service for transformation
-        transform_config = {
-            "mappings": transformation_mappings
-        }
+        transform_config = {"mappings": mappings_list}
 
         transformed_message = hl7_mapper_service.create_hl7_to_hl7_mapping(
             context.raw_message,
@@ -215,8 +255,43 @@ async def process_hl7_to_fhir_activity(activity: Dict[str, Any], context: Workfl
             ]
         }
 
-        # Apply custom mappings if specified
-        for fhir_field, mapping in mapping_config.items():
+        # Build Appointment for SIU messages if SCH present
+        try:
+            if "SCH" in segments and segments["SCH"]:
+                sch_segment = segments["SCH"][0]
+                pv1_segment = segments.get("PV1", [None])[0] if segments.get("PV1") else None
+                ail_segments = segments.get("AIL", [])
+                aip_segments = segments.get("AIP", [])
+
+                patient_resource = next((r for r in resources if r.get("resourceType") == "Patient"), None)
+                appointment, related = await _create_appointment_from_siu(
+                    sch_segment, patient_resource, pv1_segment, ail_segments, aip_segments
+                )
+                if related:
+                    resources.extend(related)
+                if appointment:
+                    resources.append(appointment)
+                # Refresh bundle entries
+                fhir_bundle["entry"] = [
+                    {"resource": r, "fullUrl": f"urn:uuid:{r['id']}"} for r in resources
+                ]
+        except Exception as e:
+            logger.error(f"Error building Appointment from SIU: {e}")
+
+        # Apply custom mappings if specified (support dict or list safely)
+        if isinstance(mapping_config, dict):
+            iterator = mapping_config.items()
+        elif isinstance(mapping_config, list):
+            # Expect list of mapping objects with 'target' (FHIR field), 'segment', 'field', 'transform'
+            iterator = [
+                (m.get('target') or m.get('fhir_field'), m) for m in mapping_config if isinstance(m, dict)
+            ]
+        else:
+            iterator = []
+
+        for fhir_field, mapping in iterator:
+            if not fhir_field or not isinstance(mapping, dict):
+                continue
             source_segment = mapping.get("segment")
             source_field = mapping.get("field")
             transform = mapping.get("transform", "direct")
@@ -582,7 +657,10 @@ def _extract_hl7_field_value(hl7_message: str, field_path: str, default: str = "
             parts = field_path.split('.')
             segment_name = parts[0]
             field_number = int(parts[1]) if len(parts) > 1 else 1
-            component = int(parts[2]) if len(parts) > 2 else 0
+            # HL7 paths are written as 1-based components (e.g., PID.5.1 => first component)
+            component = (int(parts[2]) - 1) if len(parts) > 2 else 0
+            if component < 0:
+                component = 0
 
             if segment_name in segments and segments[segment_name]:
                 segment = segments[segment_name][0]  # Use first occurrence
@@ -1486,6 +1564,122 @@ async def _create_document_reference_from_nte(nte_segments: List[str], patient_r
         }
 
     return [document_reference]
+
+
+def _parse_hl7_ts_to_iso(ts: str) -> str:
+    """Parse HL7 TS (YYYYMMDDHHMMSS[+/-ZZZZ]) to ISO 8601 string."""
+    if not ts:
+        return ""
+    try:
+        base = ts[:14]
+        dt = datetime.strptime(base, "%Y%m%d%H%M%S")
+        return dt.isoformat() + "Z"
+    except Exception:
+        try:
+            base = ts[:8]
+            dt = datetime.strptime(base, "%Y%m%d")
+            return dt.date().isoformat()
+        except Exception:
+            return ts
+
+
+async def _create_appointment_from_siu(
+    sch_segment: str,
+    patient_resource: Optional[Dict[str, Any]],
+    pv1_segment: Optional[str],
+    ail_segments: List[str],
+    aip_segments: List[str],
+) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Create FHIR Appointment from SCH/AIL/AIP segments for SIU messages."""
+    related: List[Dict[str, Any]] = []
+
+    reason_text = hl7_mapper_service.extract_segment_field(sch_segment, 7)
+    service_ce = hl7_mapper_service.extract_segment_field(sch_segment, 6)
+    service_text = service_ce.split('^')[1] if '^' in service_ce and len(service_ce.split('^')) > 1 else service_ce
+    duration = hl7_mapper_service.extract_segment_field(sch_segment, 9)
+    tq = hl7_mapper_service.extract_segment_field(sch_segment, 11)
+    start_iso = end_iso = ""
+    if tq and '^' in tq:
+        parts = tq.split('^')
+        if len(parts) > 3 and parts[3]:
+            start_iso = _parse_hl7_ts_to_iso(parts[3])
+        if len(parts) > 4 and parts[4]:
+            end_iso = _parse_hl7_ts_to_iso(parts[4])
+    status_text = hl7_mapper_service.extract_segment_field(sch_segment, 25)
+    status_map = {
+        'Scheduled': 'booked',
+        'Booked': 'booked',
+        'Arrived': 'arrived',
+        'Cancelled': 'cancelled',
+        'No Show': 'noshow'
+    }
+    appt_status = status_map.get(status_text, 'booked')
+
+    appointment: Dict[str, Any] = {
+        "resourceType": "Appointment",
+        "id": f"appointment-{uuid.uuid4()}",
+        "meta": {"lastUpdated": datetime.utcnow().isoformat() + 'Z'},
+        "status": appt_status,
+        "participant": []
+    }
+    if start_iso:
+        appointment["start"] = start_iso
+    if end_iso:
+        appointment["end"] = end_iso
+    if service_text:
+        appointment["serviceType"] = [{"text": service_text}]
+    if reason_text:
+        appointment["reason"] = [{"text": reason_text}]
+    if duration:
+        try:
+            appointment["minutesDuration"] = int(duration)
+        except Exception:
+            pass
+
+    if patient_resource:
+        appointment["participant"].append({
+            "actor": {"reference": f"Patient/{patient_resource['id']}"},
+            "status": "accepted"
+        })
+
+    # Location from AIL
+    if ail_segments:
+        ail = ail_segments[0]
+        location_name = hl7_mapper_service.extract_segment_field(ail, 4)  # AIL.4 - description
+        name = location_name.split('^')[1] if '^' in location_name and len(location_name.split('^')) > 1 else (location_name or "Location")
+        location_resource = {
+            "resourceType": "Location",
+            "id": f"location-{uuid.uuid4()}",
+            "name": name
+        }
+        related.append(location_resource)
+        appointment["participant"].append({
+            "actor": {"reference": f"Location/{location_resource['id']}"},
+            "status": "accepted"
+        })
+
+    # Practitioner from AIP
+    if aip_segments:
+        aip = aip_segments[0]
+        xcn = hl7_mapper_service.extract_segment_field(aip, 3)
+        family = given = ""
+        if xcn and '^' in xcn:
+            parts = xcn.split('^')
+            family = parts[1] if len(parts) > 1 else ""
+            given = parts[2] if len(parts) > 2 else ""
+        practitioner = {
+            "resourceType": "Practitioner",
+            "id": f"practitioner-{uuid.uuid4()}",
+            "name": [{"family": family, "given": [given] if given else []}]
+        }
+        related.append(practitioner)
+        appointment["participant"].append({
+            "actor": {"reference": f"Practitioner/{practitioner['id']}"},
+            "status": "accepted"
+        })
+
+    return appointment, related
+
 
 
 async def _create_allergy_intolerance_from_al1(al1_segments: List[str], patient_resource: Dict[str, Any]) -> List[Dict[str, Any]]:

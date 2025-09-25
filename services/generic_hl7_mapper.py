@@ -311,7 +311,13 @@ class GenericHL7Mapper:
 
             # Use first occurrence of segment
             segment = segments[segment_name][0]
-            field_value = hl7_mapper_service.extract_segment_field(segment, field_number, component)
+            had_component = len(parts) > 2
+            # If a component was specified, use 0-based component extraction; else return full field
+            field_value = self._extract_field_from_segment(
+                segment,
+                field_number,
+                component if had_component else None
+            )
 
             # Handle subcomponent if specified
             if subcomponent is not None and '&' in field_value:
