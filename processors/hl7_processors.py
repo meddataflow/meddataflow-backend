@@ -5,6 +5,7 @@ Extracted from workflow_execution_service.py for better code organization
 import csv
 import io
 import uuid
+import base64
 import logging
 from typing import Dict, List, Optional, Any
 from datetime import datetime
@@ -147,91 +148,55 @@ async def process_hl7_transformer_activity(activity: Dict[str, Any], context: Wo
 async def process_hl7_to_fhir_activity(activity: Dict[str, Any], context: WorkflowContext) -> ActivityResult:
     """
     Process HL7 to FHIR conversion activity
-    Convert any HL7 message to FHIR format
+    Convert any HL7 message to FHIR format - Generic converter for all HL7 message types
     """
     config = activity.get("config", {})
-    fhir_resource_type = config.get("resource_type", "Patient")
     mapping_config = config.get("mappings", {})
 
-    if not context.raw_message:
+    # Get the original message from variables (before any transformations)
+    original_message = context.variables.get("message", context.raw_message)
+
+    if not original_message:
         return ActivityResult(
             status=ActivityStatus.FAILED,
             error_message="No HL7 message available to convert to FHIR"
         )
 
     try:
-        # Extract segments for FHIR mapping
-        segments = hl7_mapper_service.parse_hl7_segments(context.raw_message)
+        # Extract segments for FHIR mapping using the original message
+        logger.info(f"FHIR converter using original message (first 200 chars): {original_message[:200] if original_message else 'None'}")
+        # Ensure proper line endings for parsing
+        normalized_message = original_message.replace('\\n', '\n').replace('\\r', '\r')
+        segments = hl7_mapper_service.parse_hl7_segments(normalized_message)
+        logger.info(f"After normalization, found segments: {list(segments.keys())}")
 
-        # Extract common HL7 fields directly from segments
-        patient_id = ""
-        patient_family = ""
-        patient_given = ""
-        patient_dob = ""
-        patient_gender = ""
-        encounter_class = ""
+        # Get message type from MSH segment to determine FHIR bundle type
+        message_type = "message"
+        if "MSH" in segments and segments["MSH"]:
+            msh_segment = segments["MSH"][0]
+            msg_type = hl7_mapper_service.extract_segment_field(msh_segment, 9)
+            if msg_type and "^" in msg_type:
+                msg_type_parts = msg_type.split("^")
+                message_type = "transaction" if msg_type_parts[0] in ["ADT", "ORU", "ORM"] else "message"
 
-        if "PID" in segments and segments["PID"]:
-            pid_segment = segments["PID"][0]
-            patient_id = hl7_mapper_service.extract_segment_field(pid_segment, 3)  # PID.3
-            patient_name = hl7_mapper_service.extract_segment_field(pid_segment, 5)  # PID.5
-            if patient_name:
-                name_parts = patient_name.split("^")
-                if len(name_parts) >= 2:
-                    patient_family = name_parts[0]
-                    patient_given = name_parts[1]
-            patient_dob = hl7_mapper_service.extract_segment_field(pid_segment, 7)  # PID.7
-            patient_gender = hl7_mapper_service.extract_segment_field(pid_segment, 8)  # PID.8
-
-        if "PV1" in segments and segments["PV1"]:
-            pv1_segment = segments["PV1"][0]
-            encounter_class = hl7_mapper_service.extract_segment_field(pv1_segment, 2)  # PV1.2
-
-        # Create FHIR Bundle with Patient resource
+        # Initialize resources list
         resources = []
 
-        # Patient resource
-        patient_resource = {
-            "resourceType": "Patient",
-            "id": patient_id or f"patient-{uuid.uuid4()}",
-            "meta": {
-                "lastUpdated": datetime.utcnow().isoformat() + "Z"
-            },
-            "identifier": [{
-                "system": "http://hospital.example.org/patients",
-                "value": patient_id
-            }] if patient_id else [],
-            "name": [{
-                "family": patient_family,
-                "given": [patient_given] if patient_given else []
-            }] if patient_family or patient_given else [],
-            "gender": _map_gender(patient_gender),
-            "birthDate": _format_date(patient_dob)
-        }
-
-        # Clean empty fields
-        patient_resource = {k: v for k, v in patient_resource.items() if v}
-        resources.append(patient_resource)
-
-        # Encounter resource if PV1 exists
-        if encounter_class:
-            encounter_resource = {
-                "resourceType": "Encounter",
-                "id": f"encounter-{uuid.uuid4()}",
-                "meta": {
-                    "lastUpdated": datetime.utcnow().isoformat() + "Z"
-                },
-                "status": "in-progress",
-                "class": {
-                    "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode",
-                    "code": encounter_class.lower(),
-                    "display": encounter_class
-                },
-                "subject": {
-                    "reference": f"Patient/{patient_resource['id']}"
-                }
-            }
-            resources.append(encounter_resource)
+        # Generic FHIR resource creation based on HL7 segments
+        try:
+            created_resources = await _create_fhir_resources_from_segments(segments)
+            resources.extend(created_resources)
+            logger.info(f"Created {len(created_resources)} FHIR resources from segments: {list(segments.keys())}")
+        except Exception as e:
+            logger.error(f"Error creating FHIR resources from segments: {e}")
+            # Fallback to basic resource creation if generic fails
+            if "PID" in segments:
+                patient_resource = await _create_patient_from_pid(segments["PID"][0])
+                resources.append(patient_resource)
+            if "OBX" in segments:
+                for i, obx_segment in enumerate(segments["OBX"]):
+                    observation_resource = await _create_observation_from_obx(obx_segment, i, patient_resource if 'patient_resource' in locals() else None)
+                    resources.append(observation_resource)
 
         # Create FHIR Bundle
         fhir_bundle = {
@@ -240,7 +205,7 @@ async def process_hl7_to_fhir_activity(activity: Dict[str, Any], context: Workfl
             "meta": {
                 "lastUpdated": datetime.utcnow().isoformat() + "Z"
             },
-            "type": "message",
+            "type": message_type,
             "entry": [
                 {
                     "resource": resource,
@@ -277,7 +242,7 @@ async def process_hl7_to_fhir_activity(activity: Dict[str, Any], context: Workfl
             output_data={
                 "message": "HL7 to FHIR conversion completed",
                 "fhir_bundle": fhir_bundle,
-                "fhir_resource": patient_resource,  # Keep for backward compatibility
+                "fhir_resource": resources[0] if resources else None,  # Keep for backward compatibility
                 "resource_count": len(resources)
             }
         )
@@ -688,3 +653,1130 @@ def _format_date(hl7_date: str) -> str:
         return f"{year}-{month}-{day}"
 
     return hl7_date
+
+
+def _format_hl7_datetime_to_fhir(hl7_datetime: str) -> str:
+    """Format HL7 datetime to FHIR datetime format"""
+    if not hl7_datetime or len(hl7_datetime) < 8:
+        return ""
+
+    try:
+        # HL7 datetime format: YYYYMMDDHHMMSS
+        year = hl7_datetime[:4]
+        month = hl7_datetime[4:6]
+        day = hl7_datetime[6:8]
+
+        # Check if time is included
+        if len(hl7_datetime) >= 14:
+            hour = hl7_datetime[8:10]
+            minute = hl7_datetime[10:12]
+            second = hl7_datetime[12:14]
+            return f"{year}-{month}-{day}T{hour}:{minute}:{second}Z"
+        else:
+            return f"{year}-{month}-{day}"
+    except:
+        return hl7_datetime
+
+
+async def _create_fhir_resources_from_segments(segments: Dict[str, List[str]]) -> List[Dict[str, Any]]:
+    """
+    Truly generic FHIR resource creator from HL7 segments
+    Handles ANY HL7 message type and creates appropriate FHIR resources dynamically
+    """
+    resources = []
+    patient_resource = None
+    encounter_resource = None
+
+    # Step 1: Create Patient resource from PID segment (foundational)
+    if "PID" in segments and segments["PID"]:
+        patient_resource = await _create_patient_from_pid(segments["PID"][0])
+        resources.append(patient_resource)
+
+    # Step 2: Create Encounter resource from PV1 segment
+    if "PV1" in segments and segments["PV1"]:
+        encounter_resource = await _create_encounter_from_pv1(segments["PV1"][0], patient_resource)
+        resources.append(encounter_resource)
+
+    # Step 3: Create Observation resources from OBX segments
+    if "OBX" in segments and segments["OBX"]:
+        for i, obx_segment in enumerate(segments["OBX"]):
+            observation_resource = await _create_observation_from_obx(obx_segment, i, patient_resource)
+            resources.append(observation_resource)
+
+    # Step 4: Create DiagnosticReport resource from OBR segments
+    if "OBR" in segments and segments["OBR"]:
+        for i, obr_segment in enumerate(segments["OBR"]):
+            diagnostic_report = await _create_diagnostic_report_from_obr(obr_segment, i, patient_resource)
+            resources.append(diagnostic_report)
+
+    # Step 5: Create ServiceRequest resources from ORC segments
+    if "ORC" in segments and segments["ORC"]:
+        for i, orc_segment in enumerate(segments["ORC"]):
+            service_request = await _create_service_request_from_orc(orc_segment, i, patient_resource)
+            resources.append(service_request)
+
+    # Step 6: Handle NTE segments (Notes/Comments) -> FHIR Annotation/DocumentReference
+    if "NTE" in segments and segments["NTE"]:
+        nte_resources = await _create_document_reference_from_nte(segments["NTE"], patient_resource, encounter_resource)
+        resources.extend(nte_resources)
+
+    # Step 7: Handle additional common segments dynamically
+    # NK1 -> RelatedPerson
+    if "NK1" in segments and segments["NK1"]:
+        for i, nk1_segment in enumerate(segments["NK1"]):
+            related_person = await _create_related_person_from_nk1(nk1_segment, i, patient_resource)
+            resources.append(related_person)
+
+    # Step 8: Handle AL1 segments (Allergy Information) -> AllergyIntolerance
+    if "AL1" in segments and segments["AL1"]:
+        for i, al1_segment in enumerate(segments["AL1"]):
+            allergy = await _create_allergy_intolerance_from_al1(al1_segment, i, patient_resource)
+            resources.append(allergy)
+
+    # Step 9: Handle DG1 segments (Diagnosis) -> Condition
+    if "DG1" in segments and segments["DG1"]:
+        for i, dg1_segment in enumerate(segments["DG1"]):
+            condition = await _create_condition_from_dg1(dg1_segment, i, patient_resource, encounter_resource)
+            resources.append(condition)
+
+    # Step 10: Handle PR1 segments (Procedures) -> Procedure
+    if "PR1" in segments and segments["PR1"]:
+        for i, pr1_segment in enumerate(segments["PR1"]):
+            procedure = await _create_procedure_from_pr1(pr1_segment, i, patient_resource, encounter_resource)
+            resources.append(procedure)
+
+    # Step 11: Handle IN1/IN2 segments (Insurance) -> Coverage
+    if "IN1" in segments and segments["IN1"]:
+        for i, in1_segment in enumerate(segments["IN1"]):
+            coverage = await _create_coverage_from_in1(in1_segment, i, patient_resource)
+            resources.append(coverage)
+
+    # Step 12: Handle MSA/ERR segments (Application Acknowledgment/Error) -> OperationOutcome
+    if "MSA" in segments and segments["MSA"] or "ERR" in segments and segments["ERR"]:
+        operation_outcome = await _create_operation_outcome_from_ack(segments)
+        resources.append(operation_outcome)
+
+    # Step 13: Create Practitioner and Organization resources from provider/facility references
+    practitioners = await _create_practitioners_from_segments(segments)
+    resources.extend(practitioners)
+
+    organizations = await _create_organizations_from_segments(segments)
+    resources.extend(organizations)
+
+    return resources
+
+
+async def _create_patient_from_pid(pid_segment: str) -> Dict[str, Any]:
+    """Create FHIR Patient resource from PID segment"""
+    # Extract the full PID.3 field which may contain multiple identifiers
+    full_patient_id = hl7_mapper_service.extract_segment_field(pid_segment, 3)  # PID.3
+
+    # Parse the primary patient ID (first identifier before repetition separator)
+    if "~" in full_patient_id:
+        # Multiple identifiers - use the first one
+        first_identifier = full_patient_id.split("~")[0]
+        # Extract the primary ID (first component before ^)
+        patient_id = first_identifier.split("^")[0] if "^" in first_identifier else first_identifier
+    else:
+        # Single identifier - extract primary ID component
+        patient_id = full_patient_id.split("^")[0] if "^" in full_patient_id else full_patient_id
+
+    patient_name = hl7_mapper_service.extract_segment_field(pid_segment, 5)  # PID.5
+    patient_dob = hl7_mapper_service.extract_segment_field(pid_segment, 7)  # PID.7
+    patient_gender = hl7_mapper_service.extract_segment_field(pid_segment, 8)  # PID.8
+    patient_address = hl7_mapper_service.extract_segment_field(pid_segment, 11)  # PID.11
+
+    # Parse name
+    patient_family = ""
+    patient_given = ""
+    if patient_name:
+        name_parts = patient_name.split("^")
+        if len(name_parts) >= 2:
+            patient_family = name_parts[0]
+            patient_given = name_parts[1]
+
+    patient_resource = {
+        "resourceType": "Patient",
+        "id": patient_id or f"patient-{uuid.uuid4()}",
+        "meta": {
+            "lastUpdated": datetime.utcnow().isoformat() + "Z"
+        }
+    }
+
+    # Add identifiers - handle multiple patient identifiers from PID.3
+    if full_patient_id:
+        identifiers = []
+
+        # Parse all identifiers from PID.3 field
+        if "~" in full_patient_id:
+            # Multiple identifiers separated by ~
+            identifier_parts = full_patient_id.split("~")
+        else:
+            # Single identifier
+            identifier_parts = [full_patient_id]
+
+        for idx, identifier_part in enumerate(identifier_parts):
+            if identifier_part.strip():
+                components = identifier_part.split("^")
+                id_value = components[0] if components else identifier_part
+                assigning_authority = components[3] if len(components) > 3 else ""
+                identifier_type = components[4] if len(components) > 4 else ""
+
+                # Create FHIR identifier
+                fhir_identifier = {
+                    "value": id_value
+                }
+
+                # Add use - primary for first identifier
+                if idx == 0:
+                    fhir_identifier["use"] = "usual"
+
+                # Add type based on HL7 identifier type
+                if identifier_type:
+                    if identifier_type == "MR":
+                        fhir_identifier["type"] = {
+                            "coding": [{
+                                "system": "http://terminology.hl7.org/CodeSystem/v2-0203",
+                                "code": "MR",
+                                "display": "Medical Record Number"
+                            }]
+                        }
+                    elif identifier_type == "NI":
+                        fhir_identifier["type"] = {
+                            "coding": [{
+                                "system": "http://terminology.hl7.org/CodeSystem/v2-0203",
+                                "code": "NI",
+                                "display": "National unique individual identifier"
+                            }]
+                        }
+                    elif identifier_type == "SS":
+                        fhir_identifier["type"] = {
+                            "coding": [{
+                                "system": "http://terminology.hl7.org/CodeSystem/v2-0203",
+                                "code": "SS",
+                                "display": "Social Security Number"
+                            }]
+                        }
+
+                # Add system based on assigning authority
+                if assigning_authority:
+                    if assigning_authority == "HOSP":
+                        fhir_identifier["system"] = "http://hospital.example.org/patients"
+                    elif assigning_authority == "NATID":
+                        fhir_identifier["system"] = "http://national-id.gov/patients"
+                    elif assigning_authority == "MOH":
+                        fhir_identifier["system"] = "http://moh.gov/patients"
+                    else:
+                        fhir_identifier["system"] = f"http://{assigning_authority.lower()}.example.org"
+                else:
+                    fhir_identifier["system"] = "http://hospital.example.org/patients"
+
+                identifiers.append(fhir_identifier)
+
+        if identifiers:
+            patient_resource["identifier"] = identifiers
+
+    # Add name
+    if patient_family or patient_given:
+        patient_resource["name"] = [{
+            "family": patient_family,
+            "given": [patient_given] if patient_given else []
+        }]
+
+    # Add gender
+    if patient_gender:
+        patient_resource["gender"] = _map_gender(patient_gender)
+
+    # Add birth date
+    if patient_dob:
+        patient_resource["birthDate"] = _format_date(patient_dob)
+
+    # Add address
+    if patient_address:
+        address_parts = patient_address.split("^")
+        if len(address_parts) >= 4:
+            patient_resource["address"] = [{
+                "line": [address_parts[0]] if address_parts[0] else [],
+                "city": address_parts[2] if len(address_parts) > 2 else "",
+                "state": address_parts[3] if len(address_parts) > 3 else "",
+                "postalCode": address_parts[4] if len(address_parts) > 4 else ""
+            }]
+
+    return patient_resource
+
+
+async def _create_encounter_from_pv1(pv1_segment: str, patient_resource: Dict[str, Any]) -> Dict[str, Any]:
+    """Create FHIR Encounter resource from PV1 segment"""
+    encounter_class = hl7_mapper_service.extract_segment_field(pv1_segment, 2)  # PV1.2
+
+    encounter_resource = {
+        "resourceType": "Encounter",
+        "id": f"encounter-{uuid.uuid4()}",
+        "meta": {
+            "lastUpdated": datetime.utcnow().isoformat() + "Z"
+        },
+        "status": "in-progress"
+    }
+
+    if patient_resource:
+        encounter_resource["subject"] = {
+            "reference": f"Patient/{patient_resource['id']}"
+        }
+
+    if encounter_class:
+        encounter_resource["class"] = {
+            "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+            "code": encounter_class.lower(),
+            "display": encounter_class
+        }
+
+    return encounter_resource
+
+
+async def _create_observation_from_obx(obx_segment: str, index: int, patient_resource: Dict[str, Any]) -> Dict[str, Any]:
+    """Create FHIR Observation resource from OBX segment"""
+    observation_id = hl7_mapper_service.extract_segment_field(obx_segment, 3)  # OBX.3
+    observation_value = hl7_mapper_service.extract_segment_field(obx_segment, 5)  # OBX.5
+    units = hl7_mapper_service.extract_segment_field(obx_segment, 6)  # OBX.6
+    reference_range = hl7_mapper_service.extract_segment_field(obx_segment, 7)  # OBX.7
+    abnormal_flag = hl7_mapper_service.extract_segment_field(obx_segment, 8)  # OBX.8
+    observation_datetime = hl7_mapper_service.extract_segment_field(obx_segment, 14)  # OBX.14
+
+    # Parse observation identifier
+    obs_code = observation_id
+    obs_display = observation_id
+    if "^" in observation_id:
+        obs_parts = observation_id.split("^")
+        obs_code = obs_parts[0] if len(obs_parts) > 0 else observation_id
+        obs_display = obs_parts[1] if len(obs_parts) > 1 else obs_code
+
+    observation_resource = {
+        "resourceType": "Observation",
+        "id": f"observation-{index+1}-{uuid.uuid4()}",
+        "meta": {
+            "lastUpdated": datetime.utcnow().isoformat() + "Z"
+        },
+        "status": "final",
+        "code": {
+            "coding": [{
+                "code": obs_code,
+                "display": obs_display,
+                "system": "http://loinc.org"
+            }]
+        }
+    }
+
+    if patient_resource:
+        observation_resource["subject"] = {
+            "reference": f"Patient/{patient_resource['id']}"
+        }
+
+    # Add value
+    if observation_value:
+        try:
+            numeric_value = float(observation_value)
+            observation_resource["valueQuantity"] = {
+                "value": numeric_value,
+                "unit": units if units else "",
+                "system": "http://unitsofmeasure.org",
+                "code": units if units else ""
+            }
+        except (ValueError, TypeError):
+            observation_resource["valueString"] = observation_value
+
+    # Add reference range
+    if reference_range:
+        observation_resource["referenceRange"] = [{
+            "text": reference_range
+        }]
+
+    # Add interpretation
+    if abnormal_flag:
+        interpretation_map = {"H": "H", "L": "L", "A": "A", "N": "N"}
+        interpretation_code = interpretation_map.get(abnormal_flag.upper(), "N")
+        observation_resource["interpretation"] = [{
+            "coding": [{
+                "system": "http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation",
+                "code": interpretation_code,
+                "display": abnormal_flag
+            }]
+        }]
+
+    # Add effective datetime
+    if observation_datetime:
+        formatted_datetime = _format_hl7_datetime_to_fhir(observation_datetime)
+        if formatted_datetime:
+            observation_resource["effectiveDateTime"] = formatted_datetime
+
+    return observation_resource
+
+
+async def _create_diagnostic_report_from_obr(obr_segment: str, index: int, patient_resource: Dict[str, Any]) -> Dict[str, Any]:
+    """Create FHIR DiagnosticReport resource from OBR segment"""
+    test_id = hl7_mapper_service.extract_segment_field(obr_segment, 4)  # OBR.4
+    observation_datetime = hl7_mapper_service.extract_segment_field(obr_segment, 7)  # OBR.7
+
+    # Parse test identifier
+    test_code = test_id
+    test_display = test_id
+    if "^" in test_id:
+        test_parts = test_id.split("^")
+        test_code = test_parts[0] if len(test_parts) > 0 else test_id
+        test_display = test_parts[1] if len(test_parts) > 1 else test_code
+
+    diagnostic_report = {
+        "resourceType": "DiagnosticReport",
+        "id": f"diagnosticreport-{index+1}-{uuid.uuid4()}",
+        "meta": {
+            "lastUpdated": datetime.utcnow().isoformat() + "Z"
+        },
+        "status": "final",
+        "code": {
+            "coding": [{
+                "code": test_code,
+                "display": test_display,
+                "system": "http://loinc.org"
+            }]
+        }
+    }
+
+    if patient_resource:
+        diagnostic_report["subject"] = {
+            "reference": f"Patient/{patient_resource['id']}"
+        }
+
+    if observation_datetime:
+        formatted_datetime = _format_hl7_datetime_to_fhir(observation_datetime)
+        if formatted_datetime:
+            diagnostic_report["effectiveDateTime"] = formatted_datetime
+
+    return diagnostic_report
+
+
+async def _create_service_request_from_orc(orc_segment: str, index: int, patient_resource: Dict[str, Any]) -> Dict[str, Any]:
+    """Create FHIR ServiceRequest resource from ORC segment"""
+    order_control = hl7_mapper_service.extract_segment_field(orc_segment, 1)  # ORC.1
+    placer_order_number = hl7_mapper_service.extract_segment_field(orc_segment, 2)  # ORC.2
+
+    service_request = {
+        "resourceType": "ServiceRequest",
+        "id": f"servicerequest-{index+1}-{uuid.uuid4()}",
+        "meta": {
+            "lastUpdated": datetime.utcnow().isoformat() + "Z"
+        },
+        "status": "active",
+        "intent": "order"
+    }
+
+    if patient_resource:
+        service_request["subject"] = {
+            "reference": f"Patient/{patient_resource['id']}"
+        }
+
+    if placer_order_number:
+        service_request["identifier"] = [{
+            "system": "http://hospital.example.org/orders",
+            "value": placer_order_number
+        }]
+
+    return service_request
+
+
+async def _create_related_person_from_nk1(nk1_segment: str, index: int, patient_resource: Dict[str, Any]) -> Dict[str, Any]:
+    """Create FHIR RelatedPerson resource from NK1 segment"""
+    nk1_name = hl7_mapper_service.extract_segment_field(nk1_segment, 2)  # NK1.2
+    relationship = hl7_mapper_service.extract_segment_field(nk1_segment, 3)  # NK1.3
+
+    # Parse name
+    family_name = ""
+    given_name = ""
+    if nk1_name:
+        name_parts = nk1_name.split("^")
+        if len(name_parts) >= 2:
+            family_name = name_parts[0]
+            given_name = name_parts[1]
+
+    related_person = {
+        "resourceType": "RelatedPerson",
+        "id": f"relatedperson-{index+1}-{uuid.uuid4()}",
+        "meta": {
+            "lastUpdated": datetime.utcnow().isoformat() + "Z"
+        }
+    }
+
+    if patient_resource:
+        related_person["patient"] = {
+            "reference": f"Patient/{patient_resource['id']}"
+        }
+
+    if family_name or given_name:
+        related_person["name"] = [{
+            "family": family_name,
+            "given": [given_name] if given_name else []
+        }]
+
+    if relationship:
+        related_person["relationship"] = [{
+            "coding": [{
+                "code": relationship,
+                "display": relationship,
+                "system": "http://terminology.hl7.org/CodeSystem/v3-RoleCode"
+            }]
+        }]
+
+    return related_person
+
+
+async def _create_practitioners_from_segments(segments: Dict[str, List[str]]) -> List[Dict[str, Any]]:
+    """Create FHIR Practitioner resources from provider references in various segments"""
+    practitioners = []
+    # This would extract provider references from PV1, OBR, etc. and create Practitioner resources
+    # Implementation depends on specific requirements
+    return practitioners
+
+
+async def _create_organizations_from_segments(segments: Dict[str, List[str]]) -> List[Dict[str, Any]]:
+    """Create FHIR Organization resources from facility references"""
+    organizations = []
+    # This would extract facility references from MSH and create Organization resources
+    # Implementation depends on specific requirements
+    return organizations
+
+
+async def _create_document_reference_from_nte(nte_segments: List[str], patient_resource: Dict[str, Any], encounter_resource: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Create FHIR DocumentReference resource from NTE segments (Notes/Comments)"""
+    if not nte_segments:
+        return []
+
+    # Combine all NTE segments into a single document
+    all_notes = []
+    for nte_segment in nte_segments:
+        note_text = hl7_mapper_service.extract_segment_field(nte_segment, 3)  # NTE.3 - Comment
+        if note_text:
+            all_notes.append(note_text)
+
+    if not all_notes:
+        return []
+
+    # Create a single DocumentReference with all notes
+    document_reference = {
+        "resourceType": "DocumentReference",
+        "id": f"document-{uuid.uuid4()}",
+        "meta": {
+            "lastUpdated": datetime.utcnow().isoformat() + "Z"
+        },
+        "status": "current",
+        "type": {
+            "coding": [{
+                "system": "http://loinc.org",
+                "code": "11506-3",
+                "display": "Progress note"
+            }]
+        },
+        "category": [{
+            "coding": [{
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-documentreference-category",
+                "code": "clinical-note",
+                "display": "Clinical Note"
+            }]
+        }],
+        "content": [{
+            "attachment": {
+                "contentType": "text/plain",
+                "data": "\n".join(all_notes),
+                "title": f"Clinical Notes ({len(all_notes)} entries)"
+            }
+        }]
+    }
+
+    if patient_resource:
+        document_reference["subject"] = {
+            "reference": f"Patient/{patient_resource['id']}"
+        }
+
+    if encounter_resource:
+        document_reference["context"] = {
+            "encounter": [{
+                "reference": f"Encounter/{encounter_resource['id']}"
+            }]
+        }
+
+    return [document_reference]
+
+
+async def _create_allergy_intolerance_from_al1(al1_segment: str, index: int, patient_resource: Dict[str, Any]) -> Dict[str, Any]:
+    """Create FHIR AllergyIntolerance resource from AL1 segment"""
+    allergen = hl7_mapper_service.extract_segment_field(al1_segment, 3)  # AL1.3 - Allergen
+    allergy_type = hl7_mapper_service.extract_segment_field(al1_segment, 2)  # AL1.2 - Allergen Type
+    severity = hl7_mapper_service.extract_segment_field(al1_segment, 4)  # AL1.4 - Allergy Severity
+
+    allergy_intolerance = {
+        "resourceType": "AllergyIntolerance",
+        "id": f"allergy-{index+1}-{uuid.uuid4()}",
+        "meta": {
+            "lastUpdated": datetime.utcnow().isoformat() + "Z"
+        },
+        "clinicalStatus": {
+            "coding": [{
+                "system": "http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical",
+                "code": "active",
+                "display": "Active"
+            }]
+        },
+        "verificationStatus": {
+            "coding": [{
+                "system": "http://terminology.hl7.org/CodeSystem/allergyintolerance-verification",
+                "code": "confirmed",
+                "display": "Confirmed"
+            }]
+        },
+        "code": {
+            "text": allergen if allergen else "Unknown allergen"
+        }
+    }
+
+    if patient_resource:
+        allergy_intolerance["patient"] = {
+            "reference": f"Patient/{patient_resource['id']}"
+        }
+
+    return allergy_intolerance
+
+
+async def _create_condition_from_dg1(dg1_segment: str, index: int, patient_resource: Dict[str, Any], encounter_resource: Dict[str, Any]) -> Dict[str, Any]:
+    """Create FHIR Condition resource from DG1 segment"""
+    diagnosis_code = hl7_mapper_service.extract_segment_field(dg1_segment, 3)  # DG1.3 - Diagnosis Code
+    diagnosis_description = hl7_mapper_service.extract_segment_field(dg1_segment, 4)  # DG1.4 - Diagnosis Description
+
+    condition = {
+        "resourceType": "Condition",
+        "id": f"condition-{index+1}-{uuid.uuid4()}",
+        "meta": {
+            "lastUpdated": datetime.utcnow().isoformat() + "Z"
+        },
+        "clinicalStatus": {
+            "coding": [{
+                "system": "http://terminology.hl7.org/CodeSystem/condition-clinical",
+                "code": "active",
+                "display": "Active"
+            }]
+        },
+        "verificationStatus": {
+            "coding": [{
+                "system": "http://terminology.hl7.org/CodeSystem/condition-ver-status",
+                "code": "confirmed",
+                "display": "Confirmed"
+            }]
+        },
+        "code": {
+            "coding": [{
+                "code": diagnosis_code if diagnosis_code else "unknown",
+                "display": diagnosis_description if diagnosis_description else "Unknown condition",
+                "system": "http://hl7.org/fhir/sid/icd-10"
+            }]
+        }
+    }
+
+    if patient_resource:
+        condition["subject"] = {
+            "reference": f"Patient/{patient_resource['id']}"
+        }
+
+    if encounter_resource:
+        condition["encounter"] = {
+            "reference": f"Encounter/{encounter_resource['id']}"
+        }
+
+    return condition
+
+
+async def _create_procedure_from_pr1(pr1_segment: str, index: int, patient_resource: Dict[str, Any], encounter_resource: Dict[str, Any]) -> Dict[str, Any]:
+    """Create FHIR Procedure resource from PR1 segment"""
+    procedure_code = hl7_mapper_service.extract_segment_field(pr1_segment, 3)  # PR1.3 - Procedure Code
+    procedure_description = hl7_mapper_service.extract_segment_field(pr1_segment, 4)  # PR1.4 - Procedure Description
+    procedure_date = hl7_mapper_service.extract_segment_field(pr1_segment, 5)  # PR1.5 - Procedure Date
+
+    procedure = {
+        "resourceType": "Procedure",
+        "id": f"procedure-{index+1}-{uuid.uuid4()}",
+        "meta": {
+            "lastUpdated": datetime.utcnow().isoformat() + "Z"
+        },
+        "status": "completed",
+        "code": {
+            "coding": [{
+                "code": procedure_code if procedure_code else "unknown",
+                "display": procedure_description if procedure_description else "Unknown procedure",
+                "system": "http://www.cms.gov/Medicare/Coding/ICD10"
+            }]
+        }
+    }
+
+    if patient_resource:
+        procedure["subject"] = {
+            "reference": f"Patient/{patient_resource['id']}"
+        }
+
+    if encounter_resource:
+        procedure["encounter"] = {
+            "reference": f"Encounter/{encounter_resource['id']}"
+        }
+
+    if procedure_date:
+        formatted_date = _format_hl7_datetime_to_fhir(procedure_date)
+        if formatted_date:
+            procedure["performedDateTime"] = formatted_date
+
+    return procedure
+
+
+async def _create_coverage_from_in1(in1_segment: str, index: int, patient_resource: Dict[str, Any]) -> Dict[str, Any]:
+    """Create FHIR Coverage resource from IN1 segment"""
+    plan_id = hl7_mapper_service.extract_segment_field(in1_segment, 2)  # IN1.2 - Insurance Plan ID
+    company_name = hl7_mapper_service.extract_segment_field(in1_segment, 4)  # IN1.4 - Insurance Company Name
+
+    coverage = {
+        "resourceType": "Coverage",
+        "id": f"coverage-{index+1}-{uuid.uuid4()}",
+        "meta": {
+            "lastUpdated": datetime.utcnow().isoformat() + "Z"
+        },
+        "status": "active",
+        "type": {
+            "coding": [{
+                "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+                "code": "HIP",
+                "display": "Health Insurance Plan"
+            }]
+        }
+    }
+
+    if patient_resource:
+        coverage["beneficiary"] = {
+            "reference": f"Patient/{patient_resource['id']}"
+        }
+
+    if plan_id:
+        coverage["identifier"] = [{
+            "system": "http://hospital.example.org/insurance",
+            "value": plan_id
+        }]
+
+    if company_name:
+        coverage["payor"] = [{
+            "display": company_name
+        }]
+
+    return coverage
+
+
+async def _create_operation_outcome_from_ack(segments: Dict[str, List[str]]) -> Dict[str, Any]:
+    """Create FHIR OperationOutcome resource from MSA/ERR segments"""
+    operation_outcome = {
+        "resourceType": "OperationOutcome",
+        "id": f"outcome-{uuid.uuid4()}",
+        "meta": {
+            "lastUpdated": datetime.utcnow().isoformat() + "Z"
+        },
+        "issue": []
+    }
+
+    # Process MSA segments
+    if "MSA" in segments:
+        for msa_segment in segments["MSA"]:
+            ack_code = hl7_mapper_service.extract_segment_field(msa_segment, 1)  # MSA.1 - Acknowledgment Code
+            issue = {
+                "severity": "information" if ack_code == "AA" else "error",
+                "code": "processing",
+                "details": {
+                    "text": f"Message acknowledgment: {ack_code}"
+                }
+            }
+            operation_outcome["issue"].append(issue)
+
+    # Process ERR segments
+    if "ERR" in segments:
+        for err_segment in segments["ERR"]:
+            error_code = hl7_mapper_service.extract_segment_field(err_segment, 4)  # ERR.4 - Error Code
+            error_text = hl7_mapper_service.extract_segment_field(err_segment, 8)  # ERR.8 - User Message
+            issue = {
+                "severity": "error",
+                "code": "processing",
+                "details": {
+                    "coding": [{
+                        "code": error_code if error_code else "unknown",
+                        "display": error_text if error_text else "Unknown error"
+                    }]
+                }
+            }
+            operation_outcome["issue"].append(issue)
+
+    return operation_outcome
+
+
+async def _create_document_reference_from_nte(nte_segments: List[str], patient_resource: Dict[str, Any], encounter_resource: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Create FHIR DocumentReference resource from NTE segments (Notes/Comments)"""
+    if not nte_segments:
+        return []
+
+    # Combine all NTE segments into a single document
+    all_notes = []
+    note_type = "general"  # Default note type
+
+    for nte_segment in nte_segments:
+        # NTE.1 - Set ID (optional)
+        set_id = hl7_mapper_service.extract_segment_field(nte_segment, 1)
+
+        # NTE.2 - Source of Comment (optional)
+        source = hl7_mapper_service.extract_segment_field(nte_segment, 2)
+        if source and "clinical" in source.lower():
+            note_type = "clinical"
+        elif source and "lab" in source.lower():
+            note_type = "laboratory"
+
+        # NTE.3 - Comment - this is the main content
+        note_text = hl7_mapper_service.extract_segment_field(nte_segment, 3)
+        if note_text:
+            all_notes.append(note_text)
+
+    if not all_notes:
+        return []
+
+    # Create a single DocumentReference for all notes
+    document_reference = {
+        "resourceType": "DocumentReference",
+        "id": f"doc-{uuid.uuid4()}",
+        "meta": {
+            "versionId": "1",
+            "lastUpdated": datetime.utcnow().isoformat() + "Z"
+        },
+        "status": "current",
+        "type": {
+            "coding": [{
+                "system": "http://loinc.org",
+                "code": "11506-3" if note_type == "clinical" else "34109-9",
+                "display": "Progress note" if note_type == "clinical" else "Note"
+            }]
+        },
+        "category": [{
+            "coding": [{
+                "system": "http://hl7.org/fhir/us/core/CodeSystem/us-core-documentreference-category",
+                "code": note_type,
+                "display": note_type.title()
+            }]
+        }],
+        "subject": {
+            "reference": f"Patient/{patient_resource.get('id', 'unknown')}"
+        },
+        "date": datetime.utcnow().isoformat() + "Z",
+        "content": [{
+            "attachment": {
+                "contentType": "text/plain",
+                "data": base64.b64encode('\n'.join(all_notes).encode('utf-8')).decode('utf-8')
+            }
+        }]
+    }
+
+    # Add context if encounter exists
+    if encounter_resource:
+        document_reference["context"] = {
+            "encounter": [{
+                "reference": f"Encounter/{encounter_resource.get('id', 'unknown')}"
+            }]
+        }
+
+    return [document_reference]
+
+
+async def _create_allergy_intolerance_from_al1(al1_segments: List[str], patient_resource: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Create FHIR AllergyIntolerance resources from AL1 segments"""
+    resources = []
+
+    for al1_segment in al1_segments:
+        # AL1.1 - Set ID
+        set_id = hl7_mapper_service.extract_segment_field(al1_segment, 1)
+
+        # AL1.2 - Allergen Type Code
+        allergen_type = hl7_mapper_service.extract_segment_field(al1_segment, 2)
+
+        # AL1.3 - Allergen Code/Mnemonic/Description
+        allergen_code = hl7_mapper_service.extract_segment_field(al1_segment, 3, 0)
+        allergen_text = hl7_mapper_service.extract_segment_field(al1_segment, 3, 1)
+
+        # AL1.4 - Allergy Severity Code
+        severity_code = hl7_mapper_service.extract_segment_field(al1_segment, 4)
+
+        # AL1.5 - Allergy Reaction Code
+        reaction_code = hl7_mapper_service.extract_segment_field(al1_segment, 5)
+
+        allergy_resource = {
+            "resourceType": "AllergyIntolerance",
+            "id": f"allergy-{uuid.uuid4()}",
+            "meta": {
+                "versionId": "1",
+                "lastUpdated": datetime.utcnow().isoformat() + "Z"
+            },
+            "clinicalStatus": {
+                "coding": [{
+                    "system": "http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical",
+                    "code": "active",
+                    "display": "Active"
+                }]
+            },
+            "verificationStatus": {
+                "coding": [{
+                    "system": "http://terminology.hl7.org/CodeSystem/allergyintolerance-verification",
+                    "code": "confirmed",
+                    "display": "Confirmed"
+                }]
+            },
+            "type": "allergy" if allergen_type == "DA" else "intolerance",
+            "category": ["medication" if allergen_type == "DA" else "food"],
+            "criticality": "high" if severity_code in ["SV", "H"] else "low",
+            "patient": {
+                "reference": f"Patient/{patient_resource.get('id', 'unknown')}"
+            },
+            "code": {
+                "coding": [{
+                    "code": allergen_code if allergen_code else "unknown",
+                    "display": allergen_text if allergen_text else "Unknown allergen"
+                }]
+            }
+        }
+
+        # Add reaction information if available
+        if reaction_code:
+            allergy_resource["reaction"] = [{
+                "manifestation": [{
+                    "coding": [{
+                        "code": reaction_code,
+                        "display": "Allergic reaction"
+                    }]
+                }],
+                "severity": "severe" if severity_code in ["SV", "H"] else "mild"
+            }]
+
+        resources.append(allergy_resource)
+
+    return resources
+
+
+async def _create_condition_from_dg1(dg1_segments: List[str], patient_resource: Dict[str, Any], encounter_resource: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Create FHIR Condition resources from DG1 segments (Diagnosis)"""
+    resources = []
+
+    for dg1_segment in dg1_segments:
+        # DG1.1 - Set ID
+        set_id = hl7_mapper_service.extract_segment_field(dg1_segment, 1)
+
+        # DG1.3 - Diagnosis Code
+        diagnosis_code = hl7_mapper_service.extract_segment_field(dg1_segment, 3, 0)
+        diagnosis_text = hl7_mapper_service.extract_segment_field(dg1_segment, 3, 1)
+
+        # DG1.4 - Diagnosis Description
+        diagnosis_desc = hl7_mapper_service.extract_segment_field(dg1_segment, 4)
+
+        # DG1.5 - Diagnosis Date/Time
+        diagnosis_date = hl7_mapper_service.extract_segment_field(dg1_segment, 5)
+
+        # DG1.6 - Diagnosis Type
+        diagnosis_type = hl7_mapper_service.extract_segment_field(dg1_segment, 6)
+
+        condition_resource = {
+            "resourceType": "Condition",
+            "id": f"condition-{uuid.uuid4()}",
+            "meta": {
+                "versionId": "1",
+                "lastUpdated": datetime.utcnow().isoformat() + "Z"
+            },
+            "clinicalStatus": {
+                "coding": [{
+                    "system": "http://terminology.hl7.org/CodeSystem/condition-clinical",
+                    "code": "active",
+                    "display": "Active"
+                }]
+            },
+            "verificationStatus": {
+                "coding": [{
+                    "system": "http://terminology.hl7.org/CodeSystem/condition-ver-status",
+                    "code": "confirmed",
+                    "display": "Confirmed"
+                }]
+            },
+            "category": [{
+                "coding": [{
+                    "system": "http://terminology.hl7.org/CodeSystem/condition-category",
+                    "code": "problem-list-item" if diagnosis_type == "F" else "encounter-diagnosis",
+                    "display": "Problem List Item" if diagnosis_type == "F" else "Encounter Diagnosis"
+                }]
+            }],
+            "code": {
+                "coding": [{
+                    "system": "http://hl7.org/fhir/sid/icd-10-cm",
+                    "code": diagnosis_code if diagnosis_code else "unknown",
+                    "display": diagnosis_text if diagnosis_text else diagnosis_desc if diagnosis_desc else "Unknown condition"
+                }]
+            },
+            "subject": {
+                "reference": f"Patient/{patient_resource.get('id', 'unknown')}"
+            }
+        }
+
+        # Add encounter context if available
+        if encounter_resource:
+            condition_resource["encounter"] = {
+                "reference": f"Encounter/{encounter_resource.get('id', 'unknown')}"
+            }
+
+        # Add onset date if available
+        if diagnosis_date:
+            try:
+                parsed_date = _parse_hl7_datetime(diagnosis_date)
+                if parsed_date:
+                    condition_resource["onsetDateTime"] = parsed_date
+            except:
+                pass
+
+        resources.append(condition_resource)
+
+    return resources
+
+
+async def _create_procedure_from_pr1(pr1_segments: List[str], patient_resource: Dict[str, Any], encounter_resource: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Create FHIR Procedure resources from PR1 segments"""
+    resources = []
+
+    for pr1_segment in pr1_segments:
+        # PR1.1 - Set ID
+        set_id = hl7_mapper_service.extract_segment_field(pr1_segment, 1)
+
+        # PR1.3 - Procedure Code
+        procedure_code = hl7_mapper_service.extract_segment_field(pr1_segment, 3, 0)
+        procedure_text = hl7_mapper_service.extract_segment_field(pr1_segment, 3, 1)
+
+        # PR1.4 - Procedure Description
+        procedure_desc = hl7_mapper_service.extract_segment_field(pr1_segment, 4)
+
+        # PR1.5 - Procedure Date/Time
+        procedure_date = hl7_mapper_service.extract_segment_field(pr1_segment, 5)
+
+        # PR1.11 - Surgeon
+        surgeon = hl7_mapper_service.extract_segment_field(pr1_segment, 11)
+
+        procedure_resource = {
+            "resourceType": "Procedure",
+            "id": f"procedure-{uuid.uuid4()}",
+            "meta": {
+                "versionId": "1",
+                "lastUpdated": datetime.utcnow().isoformat() + "Z"
+            },
+            "status": "completed",
+            "code": {
+                "coding": [{
+                    "system": "http://www.ama-assn.org/go/cpt",
+                    "code": procedure_code if procedure_code else "unknown",
+                    "display": procedure_text if procedure_text else procedure_desc if procedure_desc else "Unknown procedure"
+                }]
+            },
+            "subject": {
+                "reference": f"Patient/{patient_resource.get('id', 'unknown')}"
+            }
+        }
+
+        # Add encounter context if available
+        if encounter_resource:
+            procedure_resource["encounter"] = {
+                "reference": f"Encounter/{encounter_resource.get('id', 'unknown')}"
+            }
+
+        # Add performed date if available
+        if procedure_date:
+            try:
+                parsed_date = _parse_hl7_datetime(procedure_date)
+                if parsed_date:
+                    procedure_resource["performedDateTime"] = parsed_date
+            except:
+                pass
+
+        # Add performer if surgeon specified
+        if surgeon:
+            procedure_resource["performer"] = [{
+                "actor": {
+                    "display": surgeon
+                }
+            }]
+
+        resources.append(procedure_resource)
+
+    return resources
+
+
+async def _create_coverage_from_in1(in1_segments: List[str], patient_resource: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Create FHIR Coverage resources from IN1 segments (Insurance)"""
+    resources = []
+
+    for in1_segment in in1_segments:
+        # IN1.1 - Set ID
+        set_id = hl7_mapper_service.extract_segment_field(in1_segment, 1)
+
+        # IN1.2 - Insurance Plan ID
+        plan_id = hl7_mapper_service.extract_segment_field(in1_segment, 2)
+
+        # IN1.3 - Insurance Company ID
+        company_id = hl7_mapper_service.extract_segment_field(in1_segment, 3)
+
+        # IN1.4 - Insurance Company Name
+        company_name = hl7_mapper_service.extract_segment_field(in1_segment, 4)
+
+        # IN1.36 - Policy Number
+        policy_number = hl7_mapper_service.extract_segment_field(in1_segment, 36)
+
+        coverage_resource = {
+            "resourceType": "Coverage",
+            "id": f"coverage-{uuid.uuid4()}",
+            "meta": {
+                "versionId": "1",
+                "lastUpdated": datetime.utcnow().isoformat() + "Z"
+            },
+            "status": "active",
+            "type": {
+                "coding": [{
+                    "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+                    "code": "EHCPOL",
+                    "display": "extended healthcare"
+                }]
+            },
+            "policyHolder": {
+                "reference": f"Patient/{patient_resource.get('id', 'unknown')}"
+            },
+            "subscriber": {
+                "reference": f"Patient/{patient_resource.get('id', 'unknown')}"
+            },
+            "beneficiary": {
+                "reference": f"Patient/{patient_resource.get('id', 'unknown')}"
+            },
+            "relationship": {
+                "coding": [{
+                    "system": "http://terminology.hl7.org/CodeSystem/subscriber-relationship",
+                    "code": "self",
+                    "display": "Self"
+                }]
+            },
+            "period": {
+                "start": datetime.utcnow().isoformat() + "Z"
+            }
+        }
+
+        # Add payor information
+        if company_name or company_id:
+            coverage_resource["payor"] = [{
+                "display": company_name if company_name else f"Insurance Company {company_id}"
+            }]
+
+        # Add subscriber ID if available
+        if policy_number:
+            coverage_resource["subscriberId"] = policy_number
+
+        resources.append(coverage_resource)
+
+    return resources

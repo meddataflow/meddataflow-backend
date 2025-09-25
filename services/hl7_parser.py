@@ -87,6 +87,13 @@ class HL7Parser:
         # English translation templates
         self.translation_templates = self._load_translation_templates()
 
+    def _indefinite_article(self, phrase: str) -> str:
+        """Return the appropriate indefinite article ('a' or 'an') for a phrase."""
+        if not phrase:
+            return "a"
+        first = phrase.strip()[0].lower()
+        return "an" if first in "aeiou" else "a"
+
     def _load_segment_definitions(self) -> Dict[str, Dict]:
         """Load HL7 segment field definitions"""
         return {
@@ -320,18 +327,20 @@ class HL7Parser:
             segments = []
             for i, segment in enumerate(msg):
                 segment_type = str(segment[0]) if len(segment) > 0 else "UNK"
-                
-                # Convert segment to raw string for existing _parse_segment method
-                segment_fields = []
-                for j in range(len(segment)):
-                    field_value = str(segment[j]) if segment[j] is not None else ""
-                    segment_fields.append(field_value)
-                
+
                 # Reconstruct segment line for compatibility with existing parsing
                 if segment_type == "MSH":
-                    segment_line = segment_type + field_separator + field_separator.join(segment_fields[1:])
+                    # MSH serialization is special: MSH + FS + MSH-2 (encoding) + FS + remaining fields
+                    enc_chars = str(segment[2]) if len(segment) > 2 else "^~\\&"
+                    remaining = []
+                    for j in range(3, len(segment)):
+                        remaining.append(str(segment[j]) if segment[j] is not None else "")
+                    segment_line = segment_type + field_separator + enc_chars + field_separator + field_separator.join(remaining)
                 else:
-                    segment_line = segment_type + field_separator + field_separator.join(segment_fields[1:])
+                    remaining = []
+                    for j in range(1, len(segment)):
+                        remaining.append(str(segment[j]) if segment[j] is not None else "")
+                    segment_line = segment_type + field_separator + field_separator.join(remaining)
                 
                 # Use existing segment parsing method
                 parsed_segment = self._parse_segment(segment_line, i)
@@ -396,8 +405,12 @@ class HL7Parser:
                         "A12": "patient cancellation of transfer",
                         "A13": "patient cancellation of discharge"
                     }
-                    event_desc = event_descriptions.get(event_type, f"patient event ({event_type})")
-                    translation.append(f"This is an {event_desc} message sent from {sending_app} to {receiving_app} {formatted_time}.")
+                    fallback = f"{message_type_code} event"
+                    event_desc = event_descriptions.get(event_type, fallback)
+                    article = self._indefinite_article(event_desc)
+                    translation.append(
+                        f"This is {article} {event_desc} message sent from {sending_app} to {receiving_app} {formatted_time}."
+                    )
                 
                 elif message_type_code == "SIU":
                     event_descriptions = {
@@ -407,17 +420,28 @@ class HL7Parser:
                         "S15": "notification of appointment cancellation",
                         "S17": "notification of appointment deletion"
                     }
-                    event_desc = event_descriptions.get(event_type, f"scheduling event ({event_type})")
-                    translation.append(f"This is a {event_desc} sent from {sending_app} to {receiving_app} {formatted_time}.")
+                    event_desc = event_descriptions.get(event_type, "scheduling event")
+                    article = self._indefinite_article(event_desc)
+                    translation.append(
+                        f"This is {article} {event_desc} message sent from {sending_app} to {receiving_app} {formatted_time}."
+                    )
                 
                 elif message_type_code == "ORU":
                     translation.append(f"This is an observation result message sent from {sending_app} to {receiving_app} {formatted_time}.")
                 
                 elif message_type_code == "ORM":
                     translation.append(f"This is an order message sent from {sending_app} to {receiving_app} {formatted_time}.")
+
+                elif message_type_code == "DFT":
+                    # Default description for DFT messages (financial transactions/charges)
+                    translation.append(f"This is a billing/financial transaction message sent from {sending_app} to {receiving_app} {formatted_time}.")
                 
                 else:
-                    translation.append(f"This is a {message_type_code}^{event_type} message sent from {sending_app} to {receiving_app} {formatted_time}.")
+                    mt = f"{message_type_code}^{event_type}" if event_type else message_type_code
+                    article = self._indefinite_article(mt)
+                    translation.append(
+                        f"This is {article} {mt} message sent from {sending_app} to {receiving_app} {formatted_time}."
+                    )
             
             # Parse specific segments for detailed information
             
@@ -441,7 +465,17 @@ class HL7Parser:
                     
                     patient_info = f"The patient is {formatted_name}"
                     if patient_id:
-                        patient_info += f" (ID: {patient_id})"
+                        # Prefer the first repetition and show ID type and assigning authority when present
+                        first_id = patient_id.split('~')[0]
+                        id_parts = first_id.split('^')
+                        id_value = id_parts[0] if len(id_parts) > 0 else first_id
+                        assigning_auth = id_parts[3] if len(id_parts) > 3 else ""
+                        id_type = id_parts[4] if len(id_parts) > 4 else ""
+                        id_label = id_type if id_type else "ID"
+                        if assigning_auth:
+                            patient_info += f" ({id_label}: {id_value}, {assigning_auth})"
+                        else:
+                            patient_info += f" ({id_label}: {id_value})"
                     if dob:
                         try:
                             if len(dob) >= 8:
@@ -454,6 +488,26 @@ class HL7Parser:
                         patient_info += f", {gender_text}"
                     
                     translation.append(patient_info + ".")
+
+                # Add contact and language details when available
+                try:
+                    address_raw = str(pid[11]) if len(pid) > 11 else ""
+                    address = self._format_address(address_raw)
+                    phone_home_raw = str(pid[13]) if len(pid) > 13 else ""
+                    phone_home = self._format_xtn_phone(phone_home_raw)
+                    language_raw = str(pid[15]) if len(pid) > 15 else ""
+                    language = self._format_language_list(language_raw)
+                    contact_bits = []
+                    if address:
+                        contact_bits.append(f"Address: {address}")
+                    if phone_home:
+                        contact_bits.append(f"Home phone: {phone_home}")
+                    if language:
+                        contact_bits.append(f"Primary language: {language}")
+                    if contact_bits:
+                        translation.append("; ".join(contact_bits) + ".")
+                except Exception:
+                    pass
             
             # Visit Information (PV1)
             try:
@@ -462,23 +516,17 @@ class HL7Parser:
                 pv1 = None
             if pv1:
                 patient_class = str(pv1[2]) if len(pv1) > 2 else ""
-                location = str(pv1[3]) if len(pv1) > 3 else ""
+                location_raw = str(pv1[3]) if len(pv1) > 3 else ""
                 attending_doctor = str(pv1[7]) if len(pv1) > 7 else ""
                 
                 visit_info = "Visit details: "
                 if patient_class:
                     class_desc = {"I": "Inpatient", "O": "Outpatient", "E": "Emergency", "P": "Preadmit"}.get(patient_class, patient_class)
                     visit_info += f"{class_desc} visit"
-                if location:
-                    visit_info += f" at location {location}"
+                if location_raw:
+                    visit_info += f" at {self._format_location(location_raw)}"
                 if attending_doctor:
-                    # Parse doctor name
-                    doc_parts = attending_doctor.split('^')
-                    if len(doc_parts) >= 2:
-                        doc_name = f"Dr. {doc_parts[1]} {doc_parts[0]}"
-                    else:
-                        doc_name = f"Dr. {attending_doctor}"
-                    visit_info += f" with {doc_name}"
+                    visit_info += f" with {self._format_provider_name(attending_doctor)}"
                 
                 if visit_info != "Visit details: ":
                     translation.append(visit_info + ".")
@@ -514,22 +562,253 @@ class HL7Parser:
                 
                 if appt_info != "Appointment details: ":
                     translation.append(appt_info + ".")
+
+            # Next of Kin / Emergency Contact (NK1)
+            try:
+                nk1 = msg.segment('NK1')
+            except:
+                nk1 = None
+            if nk1:
+                try:
+                    nk_name_raw = str(nk1[2]) if len(nk1) > 2 else ""
+                    nk_rel_raw = str(nk1[3]) if len(nk1) > 3 else ""
+                    nk_addr_raw = str(nk1[4]) if len(nk1) > 4 else ""
+                    nk_phone_raw = str(nk1[5]) if len(nk1) > 5 else ""
+                    nk_phone = self._format_xtn_phone(nk_phone_raw)
+                    nk_name = self._format_patient_name(nk_name_raw)
+                    nk_rel = self._format_relationship(nk_rel_raw)
+                    nk_addr = self._format_address(nk_addr_raw)
+                    bits = [f"Emergency contact: {nk_name}"]
+                    if nk_rel:
+                        bits[-1] += f" ({nk_rel})"
+                    if nk_addr:
+                        bits.append(f"Address: {nk_addr}")
+                    if nk_phone:
+                        bits.append(f"Phone: {nk_phone}")
+                    translation.append("; ".join(bits) + ".")
+                except Exception:
+                    pass
             
-            # Observation Results (OBX)
-            obx_segments = [seg for seg in msg if str(seg[0]) == 'OBX']
-            if obx_segments:
+            # Observation Results (OBR/OBX/NTE)
+            segments_any = [seg for seg in msg if str(seg[0]) in ('OBR', 'OBX', 'NTE')]
+            if segments_any:
                 translation.append("Laboratory/Observation results:")
-                for obx in obx_segments[:5]:  # Limit to first 5 results
-                    observation_id = str(obx[3]) if len(obx) > 3 else ""
-                    value = str(obx[5]) if len(obx) > 5 else ""
-                    units = str(obx[6]) if len(obx) > 6 else ""
-                    
-                    if observation_id and value:
+                discrete_results: List[str] = []
+                text_groups: Dict[str, List[str]] = {}
+                context_map: Dict[str, List[str]] = {}
+                current_group: Optional[str] = None
+
+                for seg in segments_any:
+                    seg_type = str(seg[0])
+                    if seg_type == 'OBR':
+                        # Start a new group with test name
+                        test_name = self._format_ce_display(str(seg[4]) if len(seg) > 4 else "")
+                        if test_name:
+                            current_group = test_name
+                            text_groups.setdefault(current_group, [])
+                            # Add OBR context lines if available
+                            collected = self._format_hl7_datetime(str(seg[7]) if len(seg) > 7 else "")
+                            received = self._format_hl7_datetime(str(seg[8]) if len(seg) > 8 else "")
+                            ordering = self._format_provider_name(str(seg[16]) if len(seg) > 16 else "")
+                            ctx_lines: List[str] = []
+                            if collected:
+                                ctx_lines.append(f"Collected: {collected}")
+                            if received:
+                                ctx_lines.append(f"Received: {received}")
+                            if ordering and ordering != 'Unknown Provider':
+                                ctx_lines.append(f"Ordering provider: {ordering}")
+                            if ctx_lines:
+                                context_map[current_group] = ctx_lines
+                        continue
+
+                    if seg_type == 'OBX':
+                        value_type = str(seg[2]) if len(seg) > 2 else ""
+                        observation_id = str(seg[3]) if len(seg) > 3 else ""
+                        value_raw = str(seg[5]) if len(seg) > 5 else ""
+                        units_raw = str(seg[6]) if len(seg) > 6 else ""
+
                         obs_name = observation_id.split('^')[1] if '^' in observation_id else observation_id
-                        result_text = f"- {obs_name}: {value}"
-                        if units:
-                            result_text += f" {units}"
-                        translation.append(result_text)
+                        if value_type in ("TX", "FT"):
+                            if value_raw:
+                                normalized = value_raw.replace('\\.br\\', '\n')
+                                normalized = "\n".join(line.lstrip() for line in normalized.splitlines())
+                                normalized = " ".join(normalized.split()) if "\n" not in normalized else "\n".join(
+                                    " ".join(line.split()) for line in normalized.splitlines()
+                                )
+                                key = obs_name or (current_group or "Notes")
+                                text_groups.setdefault(key, []).append(normalized)
+                            continue
+
+                        # Discrete result
+                        try:
+                            if value_type in ("CE", "CWE"):
+                                parts = value_raw.split('^')
+                                display = parts[1] if len(parts) > 1 and parts[1] else parts[0]
+                                code = parts[0] if parts else ""
+                                formatted_value = f"{display} ({code})" if code and display and code != display else display
+                            elif value_type in ("TS", "DTM", "DT"):
+                                formatted_value = self._format_hl7_datetime(value_raw)
+                            elif value_type == "XCN":
+                                formatted_value = self._format_provider_name(value_raw)
+                            elif value_type == "XAD":
+                                formatted_value = self._format_address(value_raw)
+                            elif value_type == "ED":
+                                parts = value_raw.split('^')
+                                filename = parts[5] if len(parts) > 5 else "attachment"
+                                formatted_value = filename or "attachment"
+                            else:
+                                formatted_value = value_raw
+                        except Exception:
+                            formatted_value = value_raw
+
+                        units_disp = self._format_ce_display(units_raw) if units_raw else ""
+                        name_for_line = obs_name or (current_group or "Observation")
+                        line = f"- {name_for_line}: {formatted_value}" if formatted_value else f"- {name_for_line}"
+                        if units_disp:
+                            line += f" {units_disp}"
+                        discrete_results.append(line)
+                        continue
+
+                    if seg_type == 'NTE':
+                        comment = str(seg[3]) if len(seg) > 3 else ""
+                        if comment:
+                            key = current_group or "Notes"
+                            # Normalize indentation
+                            normalized = "\n".join(line.lstrip() for line in comment.splitlines())
+                            text_groups.setdefault(key, []).append(" ".join(normalized.split()))
+                        continue
+
+                # Emit discrete results
+                for line in discrete_results[:50]:
+                    translation.append(line)
+
+                # Emit grouped blocks with context lines first
+                for obs_name, lines in text_groups.items():
+                    translation.append(f"- {obs_name}:")
+                    for ctx in context_map.get(obs_name, []):
+                        translation.append(f"  - {ctx}")
+                    # Deduplicate consecutive lines
+                    last = None
+                    for l in lines:
+                        if l and l != last:
+                            translation.append(f"  - {l}")
+                            last = l
+
+            # Financial Transactions (DFT/FT1) and Procedures (PR1) and Diagnoses (DG1)
+            ft1_segments = [seg for seg in msg if str(seg[0]) == 'FT1']
+            pr1_segments = [seg for seg in msg if str(seg[0]) == 'PR1']
+            dg1_segments = [seg for seg in msg if str(seg[0]) == 'DG1']
+
+            if ft1_segments:
+                translation.append("Financial transactions:")
+                for ft1 in ft1_segments[:20]:
+                    def g(i: int) -> str:
+                        return str(ft1[i]) if len(ft1) > i else ""
+                    when = self._format_hl7_datetime(g(4)) or self._format_hl7_datetime(g(6))
+                    trans_type = g(6)
+                    code_ce = g(7)
+                    code_display = self._format_ce_display(code_ce)
+                    code_code = code_ce.split('^')[0] if code_ce else ""
+                    desc = g(8)
+                    qty = g(10)
+                    place = g(16)
+                    place_disp = self._format_ce_display(place) or (place.replace('^', ' ').strip())
+                    diag_list = g(19)
+                    diag_items = []
+                    if diag_list:
+                        for rep in diag_list.split(self.repetition_separator):
+                            if not rep:
+                                continue
+                            parts = rep.split(self.component_separator)
+                            code = parts[0] if parts else ""
+                            text = parts[1] if len(parts) > 1 else ""
+                            sys = parts[2] if len(parts) > 2 else ""
+                            if text and code:
+                                diag_items.append(f"{text} ({code})")
+                            elif text:
+                                diag_items.append(text)
+                            elif code:
+                                diag_items.append(code)
+                    perf_provider = g(20)
+                    ord_provider = g(21)
+                    provider = self._format_provider_name(perf_provider or ord_provider)
+
+                    parts_line = []
+                    if code_display or code_code:
+                        parts_line.append(f"{code_code} {code_display}".strip())
+                    if desc and desc != code_display:
+                        parts_line.append(desc)
+                    if qty:
+                        parts_line.append(f"Qty: {qty}")
+                    if when:
+                        parts_line.append(f"When: {when}")
+                    if place_disp:
+                        parts_line.append(f"Place: {place_disp}")
+                    if provider and provider != 'Unknown Provider':
+                        parts_line.append(f"Provider: {provider}")
+                    if diag_items:
+                        parts_line.append(f"Dx: {', '.join(diag_items)}")
+
+                    translation.append("- " + "; ".join([p for p in parts_line if p]))
+
+            if pr1_segments:
+                translation.append("Procedures:")
+                for pr1 in pr1_segments[:20]:
+                    def g(i: int) -> str:
+                        return str(pr1[i]) if len(pr1) > i else ""
+                    code_ce = g(3)
+                    code = code_ce.split('^')[1] if '^' in code_ce else code_ce
+                    code_code = code_ce.split('^')[0] if '^' in code_ce else ""
+                    desc = g(4)
+                    when = self._format_hl7_datetime(g(5))
+                    provider = self._format_provider_name(g(11))
+                    dx_list = g(15)
+                    diag_items = []
+                    if dx_list:
+                        for rep in dx_list.split(self.repetition_separator):
+                            parts = rep.split(self.component_separator)
+                            dcode = parts[0] if parts else ""
+                            dtext = parts[1] if len(parts) > 1 else ""
+                            if dtext and dcode:
+                                diag_items.append(f"{dtext} ({dcode})")
+                            elif dtext:
+                                diag_items.append(dtext)
+                            elif dcode:
+                                diag_items.append(dcode)
+                    pieces = []
+                    if code or code_code:
+                        pieces.append(f"{code_code} {code}".strip())
+                    if desc and desc != code:
+                        pieces.append(desc)
+                    if when:
+                        pieces.append(f"Date: {when}")
+                    if provider and provider != 'Unknown Provider':
+                        pieces.append(f"Provider: {provider}")
+                    if diag_items:
+                        pieces.append(f"Dx: {', '.join(diag_items)}")
+                    translation.append("- " + "; ".join([p for p in pieces if p]))
+
+            if dg1_segments:
+                translation.append("Diagnoses:")
+                for dg1 in dg1_segments[:20]:
+                    def g(i: int) -> str:
+                        return str(dg1[i]) if len(dg1) > i else ""
+                    coding_sys = g(2)
+                    ce = g(3)
+                    code = ce.split('^')[0] if ce else ""
+                    text = ce.split('^')[1] if '^' in ce and len(ce.split('^')) > 1 else g(4)
+                    when = self._format_hl7_datetime(g(5))
+                    provider = self._format_provider_name(g(16))
+                    items = []
+                    if code or text:
+                        items.append(f"{text} ({code})" if code and text else (text or code))
+                    if coding_sys:
+                        items.append(f"System: {coding_sys}")
+                    if when:
+                        items.append(f"On: {when}")
+                    if provider and provider != 'Unknown Provider':
+                        items.append(f"By: {provider}")
+                    translation.append("- " + "; ".join(items))
             
             if not translation:
                 translation.append("This is an HL7 message with standard healthcare information.")
@@ -551,10 +830,13 @@ class HL7Parser:
         if segment_type == "MSH":
             # MSH field 1 is the field separator itself
             fields.append(HL7Field("MSH.1", self.field_separator, "ST", "Field Separator", True))
-            # MSH field 2 is encoding characters
-            fields.append(HL7Field("MSH.2", segment_line[4:8], "ST", "Encoding Characters", True))
-            # Remaining fields start from position 8
-            remaining_fields = segment_line[8:].split(self.field_separator) if len(segment_line) > 8 else []
+            # MSH field 2 is the 4 encoding characters immediately after 'MSH' + FS
+            # Find the next field separator after index 4
+            next_sep = segment_line.find(self.field_separator, 4)
+            enc_chars = segment_line[4:next_sep] if next_sep != -1 else segment_line[4:8]
+            fields.append(HL7Field("MSH.2", enc_chars, "ST", "Encoding Characters", True))
+            # Remaining fields start right after that separator
+            remaining_fields = segment_line[next_sep+1:].split(self.field_separator) if next_sep != -1 else []
             field_start = 3
         else:
             remaining_fields = segment_line[4:].split(self.field_separator) if len(segment_line) > 4 else []
@@ -579,6 +861,76 @@ class HL7Parser:
                 is_required=field_def.get("required", False),
                 max_length=field_def.get("max_length")
             ))
+
+            # Add component/subcomponent fields and handle repetitions
+            try:
+                reps = field_value.split(self.repetition_separator) if field_value else []
+                for rep_index, rep in enumerate(reps, start=1):
+                    components = rep.split(self.component_separator) if rep else []
+                    for comp_index, comp in enumerate(components, start=1):
+                        comp_path = f"{segment_type}.{field_num}.{comp_index}"
+                        if rep_index > 1:
+                            comp_path = f"{comp_path}[{rep_index}]"
+                        fields.append(HL7Field(
+                            path=comp_path,
+                            value=comp,
+                            data_type="component",
+                            description=f"{field_def.get('name', f'Field {field_num}')} - component {comp_index}",
+                            is_required=False,
+                            max_length=None
+                        ))
+                        if comp and self.subcomponent_separator in comp:
+                            subs = comp.split(self.subcomponent_separator)
+                            for sub_index, sub in enumerate(subs, start=1):
+                                sub_path = f"{segment_type}.{field_num}.{comp_index}.{sub_index}"
+                                if rep_index > 1:
+                                    sub_path = f"{sub_path}[{rep_index}]"
+                                fields.append(HL7Field(
+                                    path=sub_path,
+                                    value=sub,
+                                    data_type="subcomponent",
+                                    description=f"{field_def.get('name', f'Field {field_num}')} - component {comp_index}.{sub_index}",
+                                    is_required=False,
+                                    max_length=None
+                                ))
+            except Exception:
+                pass
+
+            # Add component and subcomponent fields, including repetitions
+            try:
+                repetitions = field_value.split(self.repetition_separator) if field_value else []
+                for rep_index, rep_value in enumerate(repetitions, start=1):
+                    components = rep_value.split(self.component_separator) if rep_value else []
+                    for comp_index, comp_value in enumerate(components, start=1):
+                        comp_path = f"{segment_type}.{field_num}.{comp_index}"
+                        if rep_index > 1:
+                            comp_path = f"{comp_path}[{rep_index}]"
+                        comp_desc = f"{field_def.get('name', f'Field {field_num}')} - component {comp_index}"
+                        fields.append(HL7Field(
+                            path=comp_path,
+                            value=comp_value,
+                            data_type="component",
+                            description=comp_desc,
+                            is_required=False,
+                            max_length=None
+                        ))
+                        if comp_value and self.subcomponent_separator in comp_value:
+                            subs = comp_value.split(self.subcomponent_separator)
+                            for sub_index, sub_value in enumerate(subs, start=1):
+                                sub_path = f"{segment_type}.{field_num}.{comp_index}.{sub_index}"
+                                if rep_index > 1:
+                                    sub_path = f"{sub_path}[{rep_index}]"
+                                sub_desc = f"{field_def.get('name', f'Field {field_num}')} - component {comp_index}.{sub_index}"
+                                fields.append(HL7Field(
+                                    path=sub_path,
+                                    value=sub_value,
+                                    data_type="subcomponent",
+                                    description=sub_desc,
+                                    is_required=False,
+                                    max_length=None
+                                ))
+            except Exception:
+                pass
 
         return HL7Segment(
             type=segment_type,
@@ -766,38 +1118,101 @@ class HL7Parser:
         return provider_field.split(self.component_separator)[0] or "Unknown Provider"
 
     def _format_address(self, address_field: str) -> str:
-        """Format HL7 address field"""
+        """Format HL7 XAD (address) field"""
         if not address_field:
             return ""
-        
-        parts = address_field.split(self.component_separator)
+        # Use first repetition if multiple
+        first = address_field.split(self.repetition_separator)[0]
+        parts = first.split(self.component_separator)
         street = parts[0] if len(parts) > 0 else ""
+        other = parts[1] if len(parts) > 1 else ""
         city = parts[2] if len(parts) > 2 else ""
         state = parts[3] if len(parts) > 3 else ""
         zip_code = parts[4] if len(parts) > 4 else ""
-        
-        address_parts = [street, city, state, zip_code]
+        country = parts[6] if len(parts) > 6 else ""
+        line = ", ".join(p for p in [street, other] if p)
+        address_parts = [line if line else street, city, state, zip_code, country]
         return ", ".join(part for part in address_parts if part).strip()
 
+    def _format_ce_display(self, ce_field: str) -> str:
+        """Return the human-readable component (typically second component) of a CE value."""
+        if not ce_field:
+            return ""
+        parts = ce_field.split(self.component_separator)
+        # Prefer the text (component 2) if present, else the code (component 1)
+        if len(parts) > 1 and parts[1]:
+            return parts[1]
+        return parts[0] if parts else ""
+
+    def _format_xtn_phone(self, xtn_field: str) -> str:
+        """Format HL7 XTN (telecom) into +<country>-<area>-<number> when possible."""
+        if not xtn_field:
+            return ""
+        first = xtn_field.split(self.repetition_separator)[0]
+        parts = first.split(self.component_separator)
+        country = parts[5] if len(parts) > 5 else ""
+        area = parts[6] if len(parts) > 6 else ""
+        number = parts[7] if len(parts) > 7 else ""
+        if number:
+            if country and area:
+                return f"+{country}-{area}-{number}"
+            if area:
+                return f"{area}-{number}"
+            return number
+        return first
+
+    def _format_language_list(self, ce_repeating_field: str) -> str:
+        """Format repeating CE values into comma-separated display names."""
+        if not ce_repeating_field:
+            return ""
+        reps = ce_repeating_field.split(self.repetition_separator)
+        displays = [self._format_ce_display(rep) for rep in reps if rep]
+        seen = set()
+        uniq = []
+        for d in displays:
+            if d and d not in seen:
+                seen.add(d)
+                uniq.append(d)
+        return ", ".join(uniq)
+
     def _format_location(self, location_field: str) -> str:
-        """Format HL7 location field"""
+        """Format HL7 PL (Person Location) field with repetitions."""
         if not location_field:
             return "Unknown location"
-        
-        parts = location_field.split(self.component_separator)
-        room = parts[0] if len(parts) > 0 else ""
-        bed = parts[1] if len(parts) > 1 else ""
-        unit = parts[2] if len(parts) > 2 else ""
-        
-        location_parts = []
-        if room:
-            location_parts.append(f"Room {room}")
-        if bed:
-            location_parts.append(f"Bed {bed}")
-        if unit:
-            location_parts.append(f"Unit {unit}")
-        
-        return ", ".join(location_parts) if location_parts else location_field
+
+        def format_single_pl(pl_value: str) -> str:
+            parts = pl_value.split(self.component_separator)
+            poc = parts[0] if len(parts) > 0 else ""  # Point of care (ward)
+            room = parts[1] if len(parts) > 1 else ""
+            bed = parts[2] if len(parts) > 2 else ""
+            facility = parts[3] if len(parts) > 3 else ""
+            person_loc_type = parts[5] if len(parts) > 5 else ""  # e.g., BED
+            building = parts[6] if len(parts) > 6 else ""
+            floor = parts[7] if len(parts) > 7 else ""
+            desc = parts[8] if len(parts) > 8 else ""
+
+            bits = []
+            if poc:
+                bits.append(f"Ward {poc}")
+            if room:
+                bits.append(f"Room {room}")
+            if bed:
+                bits.append(f"Bed {bed}")
+            if facility:
+                bits.append(f"Facility {facility}")
+            if building:
+                bits.append(f"Building {building}")
+            if floor:
+                bits.append(f"Floor {floor}")
+            if desc:
+                bits.append(desc)
+            if person_loc_type and person_loc_type != bed:
+                bits.append(person_loc_type)
+            return ", ".join(bits) if bits else pl_value
+
+        reps = location_field.split(self.repetition_separator)
+        formatted = [format_single_pl(rep) for rep in reps if rep]
+        return "; ".join(formatted)
 
     def _format_test_name(self, test_field: str) -> str:
         """Format HL7 test name field"""
@@ -976,9 +1391,10 @@ class HL7Parser:
                     elif not control_id_field:
                         errors.append("MSH.10 (Message Control ID) field is missing")
                     
-                    # MSH.11 (Processing ID) should be P, T, or D
+                    # MSH.11 (Processing ID) should be P, T, or D (use first component if composite)
                     if processing_id_field:
-                        processing_id = processing_id_field.value.strip()
+                        raw_pid = processing_id_field.value.strip()
+                        processing_id = raw_pid.split('^')[0] if raw_pid else ""
                         if processing_id and processing_id not in ['P', 'T', 'D']:
                             errors.append("MSH.11 (Processing ID) should be P (Production), T (Training), or D (Debugging)")
                     else:
