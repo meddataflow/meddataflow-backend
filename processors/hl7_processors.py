@@ -332,13 +332,19 @@ async def process_hl7_to_fhir_activity(activity: Dict[str, Any], context: Workfl
 
 async def process_hl7_to_csv_activity(activity: Dict[str, Any], context: WorkflowContext) -> ActivityResult:
     """
-    Process HL7 to CSV conversion activity
+    Enhanced HL7 to CSV conversion activity
     User creates custom headers and decides what segment to put in each header
     Can use global variables defined in parser activity or hardcode strings
+    Supports configurable delimiters and header inclusion options
     """
     config = activity.get("config", {})
     headers = config.get("headers", [])
     mappings = config.get("mappings", {})
+
+    # Enhanced CSV options (merged from CSV Converter)
+    delimiter = config.get("delimiter", ",")  # Support configurable delimiter
+    include_headers = config.get("include_headers", True)  # Support header inclusion option
+
     # Support UI shape: csv_headers (array or CSV string) and field_mappings (JSON string)
     csv_headers = config.get("csv_headers")
     field_mappings = config.get("field_mappings")
@@ -436,8 +442,8 @@ async def process_hl7_to_csv_activity(activity: Dict[str, Any], context: Workflo
 
         csv_data.append(csv_row)
 
-        # Convert to CSV string
-        csv_string = _convert_to_csv_string(csv_data, headers)
+        # Convert to CSV string with configurable options
+        csv_string = _convert_to_csv_string(csv_data, headers, delimiter=delimiter, include_headers=include_headers)
 
         return ActivityResult(
             status=ActivityStatus.COMPLETED,
@@ -697,11 +703,12 @@ def _generate_readable_hl7_text(parsed_message: ParsedHL7Message) -> str:
     return " | ".join(readable_parts)
 
 
-def _convert_to_csv_string(data: List[Dict], headers: List[str]) -> str:
-    """Convert list of dictionaries to CSV string"""
+def _convert_to_csv_string(data: List[Dict], headers: List[str], delimiter: str = ",", include_headers: bool = True) -> str:
+    """Convert list of dictionaries to CSV string with configurable options"""
     output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=headers)
-    writer.writeheader()
+    writer = csv.DictWriter(output, fieldnames=headers, delimiter=delimiter)
+    if include_headers:
+        writer.writeheader()
     for row in data:
         writer.writerow(row)
     return output.getvalue()

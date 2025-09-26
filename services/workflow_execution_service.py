@@ -27,7 +27,8 @@ from utils.workflow_utils import extract_hl7_value, evaluate_condition, map_gend
 # Import processors
 from processors.core_processors import (
     process_filter_activity, process_transform_activity,
-    process_csv_converter_activity, process_s3_storage_activity
+    process_s3_storage_activity
+    # process_csv_converter_activity merged into hl7_to_csv
 )
 from processors.gcs_storage_processor import process_gcs_storage_activity
 from processors.database_processors import (
@@ -91,7 +92,7 @@ class WorkflowExecutionService:
             # Core activities from main goal
             "filter": process_filter_activity,
             "transform": process_transform_activity,
-            "csv_converter": process_csv_converter_activity,
+            # "csv_converter": merged into hl7_to_csv activity
             "s3_storage": process_s3_storage_activity,
             "gcs_storage": process_gcs_storage_activity,
             "csv_batcher": process_csv_batcher_activity,
