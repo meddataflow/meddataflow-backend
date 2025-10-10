@@ -1400,6 +1400,55 @@ class HL7Parser:
                     else:
                         errors.append("MSH.11 (Processing ID) field is missing")
             
+            # Code table validations (common v2)
+            def _get_field(path: str) -> Optional[str]:
+                for seg in parsed_message.segments:
+                    for f in seg.fields:
+                        if f.path == path:
+                            return f.value
+                return None
+
+            # HL7 version
+            version = _get_field('MSH.12') or parsed_message.hl7_version
+            if version and not str(version).startswith(('2.3', '2.4', '2.5', '2.6', '2.7', '2.8')):
+                errors.append(f"Unsupported HL7 version: {version}")
+
+            # Patient gender PID.8
+            pid8 = _get_field('PID.8')
+            if pid8 and pid8 not in ['M', 'F', 'O', 'U']:
+                errors.append("PID.8 (Administrative Sex) should be one of M,F,O,U")
+
+            # Patient class PV1.2
+            pv12 = _get_field('PV1.2')
+            if 'ADT' in (parsed_message.message_type or '') and not pv12:
+                errors.append("PV1.2 (Patient Class) is required for ADT messages")
+            if pv12 and pv12 not in ['I', 'O', 'E', 'P', 'R', 'B']:
+                # Inpatient/Outpatient/Emergency/Preadmit/Recurring/Birth
+                errors.append("PV1.2 (Patient Class) should be one of I,O,E,P,R,B")
+
+            # OBX.11 result status
+            obx_statuses = {'F', 'C', 'P', 'X', 'U', 'I', 'R', 'S', 'N', 'D', 'W'}
+            for seg in parsed_message.segments:
+                if seg.type == 'OBX':
+                    for f in seg.fields:
+                        if f.path == 'OBX.11':
+                            if f.value and f.value not in obx_statuses:
+                                errors.append("OBX.11 (Result Status) has invalid value")
+
+            # Cardinality checks
+            # MSH.9 format MSG: e.g., ADT^A04
+            mtype = _get_field('MSH.9') or parsed_message.message_type
+            if mtype and '^' not in mtype:
+                errors.append("MSH.9 (Message Type) should include trigger event (e.g., ADT^A01)")
+
+            # PID.3 Patient Identifier List length cap (first repetition)
+            pid3 = _get_field('PID.3')
+            if pid3:
+                first = pid3.split('~')[0]
+                id_value = first.split('^')[0]
+                if len(id_value) > 64:
+                    errors.append("PID.3 (Patient Identifier) too long (max 64)")
+
             # If no errors found, message is valid
             if not errors:
                 return []

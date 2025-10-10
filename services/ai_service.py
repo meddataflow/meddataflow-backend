@@ -350,6 +350,287 @@ Be specific with configurations and make sure all required fields are included.
                             {"value_source": "message", "field_path": "PID.3", "validation_type": "regex", "expected_value": "^[0-9]+$"}
                         ]
                     }
+                },
+
+                "fhir_parser": {
+                    "description": "Parse FHIR resources and extract fields into workflow variables",
+                    "config_schema": {
+                        "input_variable": "fhir_payload",
+                        "extraction_rules": [
+                            {"name": "FHIR_ID", "path": "id"},
+                            {"name": "FHIR_RESOURCE_TYPE", "path": "resourceType"}
+                        ],
+                        "store_parsed_as": "fhir_resource"
+                    }
+                },
+                "fhir_transformer": {
+                    "description": "Apply transformation rules to FHIR resources",
+                    "config_schema": {
+                        "input_variable": "fhir_resource",
+                        "output_variable": "fhir_transformed",
+                        "transformation_rules": [
+                            {"source_path": "name[0].family", "target_path": "patient.last_name", "operation": "copy"},
+                            {"operation": "set", "target_path": "meta.profile[0]", "value": "http://hl7.org/fhir/us/core/StructureDefinition/us-core-patient"}
+                        ]
+                    }
+                },
+                "fhir_translator": {
+                    "description": "Translate FHIR resources into alternative formats (e.g., HL7v2, JSON)",
+                    "config_schema": {
+                        "input_variable": "fhir_transformed",
+                        "target_format": "hl7v2",
+                        "store_result_as": "fhir_hl7v2",
+                        "translation_mappings": {}
+                    }
+                },
+                "fhir_sender": {
+                    "description": "Send FHIR payloads to RESTful endpoints",
+                    "config_schema": {
+                        "payload_variable": "fhir_transformed",
+                        "endpoint_url": "https://ehr.example.com/fhir",
+                        "transport_protocol": "https",
+                        "simulate": True
+                    }
+                },
+
+                "dicom_parser": {
+                    "description": "Parse DICOM payloads (binary or metadata) and extract summary details",
+                    "config_schema": {
+                        "input_variable": "dicom_payload",
+                        "store_parsed_as": "dicom_metadata"
+                    }
+                },
+                "dicom_transformer": {
+                    "description": "Apply transformation rules to DICOM metadata",
+                    "config_schema": {
+                        "input_variable": "dicom_metadata",
+                        "output_variable": "dicom_transformed_metadata",
+                        "transformation_rules": [
+                            {"source_path": "PatientName", "target_path": "patient.name", "operation": "copy"}
+                        ]
+                    }
+                },
+                "dicom_translator": {
+                    "description": "Translate DICOM metadata into FHIR ImagingStudy or DiagnosticReport",
+                    "config_schema": {
+                        "input_variable": "dicom_transformed_metadata",
+                        "target_format": "imagingstudy",
+                        "store_result_as": "dicom_imaging_study"
+                    }
+                },
+                "dicom_sender": {
+                    "description": "Send DICOM payloads to PACS/VNA endpoints (simulated by default)",
+                    "config_schema": {
+                        "payload_variable": "dicom_payload",
+                        "endpoint_url": "dicom://pacs.example.com",
+                        "transport_protocol": "dicom",
+                        "simulate": True
+                    }
+                },
+
+                "ncpdp_parser": {
+                    "description": "Parse NCPDP SCRIPT/Telecom messages into key/value pairs",
+                    "config_schema": {
+                        "input_variable": "ncpdp_payload",
+                        "store_parsed_as": "ncpdp_message"
+                    }
+                },
+                "ncpdp_transformer": {
+                    "description": "Transform NCPDP fields using mapping rules",
+                    "config_schema": {
+                        "input_variable": "ncpdp_message",
+                        "output_variable": "ncpdp_transformed",
+                        "transformation_rules": [
+                            {"source_path": "ABA", "target_path": "pharmacy.id", "operation": "copy"}
+                        ]
+                    }
+                },
+                "ncpdp_translator": {
+                    "description": "Translate NCPDP message into JSON or other interchange formats",
+                    "config_schema": {
+                        "input_variable": "ncpdp_transformed",
+                        "target_format": "json",
+                        "store_result_as": "ncpdp_json"
+                    }
+                },
+                "ncpdp_sender": {
+                    "description": "Send NCPDP payload to external switch or PBM endpoints",
+                    "config_schema": {
+                        "payload_variable": "ncpdp_transformed",
+                        "endpoint_url": "tcp://switch.example.com:5000",
+                        "transport_protocol": "tcp",
+                        "simulate": True
+                    }
+                },
+
+                "x12_parser": {
+                    "description": "Parse X12 EDI payloads into segment dictionary",
+                    "config_schema": {
+                        "input_variable": "x12_payload",
+                        "store_parsed_as": "x12_message"
+                    }
+                },
+                "x12_transformer": {
+                    "description": "Transform X12 segments using mapping rules",
+                    "config_schema": {
+                        "input_variable": "x12_message",
+                        "output_variable": "x12_transformed",
+                        "transformation_rules": [
+                            {"source_path": "ISA[0][5]", "target_path": "sender_id", "operation": "copy"}
+                        ]
+                    }
+                },
+                "x12_translator": {
+                    "description": "Translate X12 payload into JSON or flat-file representations",
+                    "config_schema": {
+                        "input_variable": "x12_transformed",
+                        "target_format": "json",
+                        "store_result_as": "x12_json"
+                    }
+                },
+                "x12_sender": {
+                    "description": "Send X12 payloads through SFTP/AS2 gateways (simulated by default)",
+                    "config_schema": {
+                        "payload_variable": "x12_transformed",
+                        "endpoint_url": "sftp://payer.example.com/edi",
+                        "transport_protocol": "sftp",
+                        "simulate": True
+                    }
+                },
+
+                "cda_parser": {
+                    "description": "Parse CDA documents and extract summary metadata",
+                    "config_schema": {
+                        "input_variable": "cda_payload",
+                        "store_parsed_as": "cda_document"
+                    }
+                },
+                "cda_transformer": {
+                    "description": "Apply metadata transformations to CDA documents",
+                    "config_schema": {
+                        "input_variable": "cda_document",
+                        "output_variable": "cda_transformed",
+                        "transformation_rules": [
+                            {"source_path": "summary.title", "target_path": "metadata.title", "operation": "copy"}
+                        ]
+                    }
+                },
+                "cda_translator": {
+                    "description": "Translate CDA into JSON bundles or other clinical document formats",
+                    "config_schema": {
+                        "input_variable": "cda_transformed",
+                        "target_format": "json",
+                        "store_result_as": "cda_json"
+                    }
+                },
+                "cda_sender": {
+                    "description": "Send CDA documents to HIE/Direct endpoints (simulated by default)",
+                    "config_schema": {
+                        "payload_variable": "cda_document",
+                        "endpoint_url": "https://hie.example.com/cda",
+                        "transport_protocol": "https",
+                        "simulate": True
+                    }
+                },
+
+                "ccd_parser": {
+                    "description": "Parse CCD documents and extract summary metadata",
+                    "config_schema": {
+                        "input_variable": "ccd_payload",
+                        "store_parsed_as": "ccd_document"
+                    }
+                },
+                "ccd_transformer": {
+                    "description": "Apply metadata transformations to CCD documents",
+                    "config_schema": {
+                        "input_variable": "ccd_document",
+                        "output_variable": "ccd_transformed",
+                        "transformation_rules": []
+                    }
+                },
+                "ccd_translator": {
+                    "description": "Translate CCD into alternate formats (JSON, FHIR Composition)",
+                    "config_schema": {
+                        "input_variable": "ccd_transformed",
+                        "target_format": "json",
+                        "store_result_as": "ccd_json"
+                    }
+                },
+                "ccd_sender": {
+                    "description": "Send CCD payloads to care coordination endpoints (simulated by default)",
+                    "config_schema": {
+                        "payload_variable": "ccd_document",
+                        "endpoint_url": "https://ccd-endpoint.example.com/upload",
+                        "transport_protocol": "https",
+                        "simulate": True
+                    }
+                },
+
+                "ccr_parser": {
+                    "description": "Parse CCR documents and extract summary metadata",
+                    "config_schema": {
+                        "input_variable": "ccr_payload",
+                        "store_parsed_as": "ccr_document"
+                    }
+                },
+                "ccr_transformer": {
+                    "description": "Apply metadata transformations to CCR documents",
+                    "config_schema": {
+                        "input_variable": "ccr_document",
+                        "output_variable": "ccr_transformed",
+                        "transformation_rules": []
+                    }
+                },
+                "ccr_translator": {
+                    "description": "Translate CCR into alternate formats (JSON, FHIR Composition)",
+                    "config_schema": {
+                        "input_variable": "ccr_transformed",
+                        "target_format": "json",
+                        "store_result_as": "ccr_json"
+                    }
+                },
+                "ccr_sender": {
+                    "description": "Send CCR payloads to care coordination endpoints (simulated by default)",
+                    "config_schema": {
+                        "payload_variable": "ccr_document",
+                        "endpoint_url": "https://ccr-endpoint.example.com/upload",
+                        "transport_protocol": "https",
+                        "simulate": True
+                    }
+                },
+
+                "terminology_lookup": {
+                    "description": "Resolve clinical codes (SNOMED CT, ICD, LOINC, etc.) into concepts",
+                    "config_schema": {
+                        "code_system": "SNOMED",
+                        "code": "123456",
+                        "store_result_as": "concept"
+                    }
+                },
+                "terminology_mapper": {
+                    "description": "Map codes between code systems using lookup tables",
+                    "config_schema": {
+                        "source_code": "123456",
+                        "mapping_table": {"123456": "A01"},
+                        "store_result_as": "mapped_code"
+                    }
+                },
+                "terminology_translator": {
+                    "description": "Translate codes into target code systems (e.g., SNOMED → ICD-10)",
+                    "config_schema": {
+                        "source_code": "123456",
+                        "target_system": "ICD10",
+                        "store_result_as": "icd10_code",
+                        "translation_profile": {"123456": "A01.1"}
+                    }
+                },
+                "terminology_publisher": {
+                    "description": "Publish code mappings to external terminology services",
+                    "config_schema": {
+                        "payload_variable": "mapped_code",
+                        "endpoint_url": "https://terminology.example.com",
+                        "simulate": True
+                    }
                 }
             },
 

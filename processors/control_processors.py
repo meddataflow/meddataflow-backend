@@ -312,6 +312,92 @@ async def process_validation_activity(
     )
 
 
+async def process_content_router_activity(
+    activity: Dict[str, Any],
+    context: WorkflowContext
+) -> ActivityResult:
+    """
+    Content-Based Router
+    Evaluates a list of route rules against variables and sets routing variables.
+
+    Config schema (example):
+    {
+      "routes": [
+        {"match": {"variable": "MESSAGE_TYPE", "operator": "equals", "value": "ADT^A04"}, "action": "route", "route": "ADT"},
+        {"match": {"variable": "MESSAGE_TYPE", "operator": "starts_with", "value": "ORM"}, "action": "skip", "skip_next_n": 2},
+        {"match": {"variable": "ERROR_FLAG", "operator": "equals", "value": "1"}, "action": "stop"}
+      ],
+      "default_route": "default"
+    }
+    """
+    cfg = activity.get("config", {}) or {}
+    routes = cfg.get("routes", []) or []
+    default_route = cfg.get("default_route")
+
+    # Reuse core condition eval
+    try:
+        from .core_processors import _evaluate_condition as _eval
+    except Exception:
+        def _eval(actual_value, operator, expected_value):
+            a = str(actual_value or "")
+            e = str(expected_value or "")
+            if operator == "equals":
+                return a == e
+            if operator == "not_equals":
+                return a != e
+            if operator == "contains":
+                return e in a
+            if operator == "starts_with":
+                return a.startswith(e)
+            if operator == "ends_with":
+                return a.endswith(e)
+            return False
+
+    decided = {
+        "route": None,
+        "skip_next_n": 0,
+        "stop_workflow": False
+    }
+
+    for rule in routes:
+        match = (rule or {}).get("match", {})
+        var = match.get("variable")
+        operator = match.get("operator", "equals")
+        expected = match.get("value")
+        actual = context.variables.get(var)
+        if _eval(actual, operator, expected):
+            action = (rule.get("action") or "route").lower()
+            if action == "route":
+                decided["route"] = rule.get("route")
+            elif action == "skip":
+                try:
+                    decided["skip_next_n"] = int(rule.get("skip_next_n") or 0)
+                except Exception:
+                    decided["skip_next_n"] = 0
+            elif action == "stop":
+                decided["stop_workflow"] = True
+            break
+
+    if not decided["route"] and default_route:
+        decided["route"] = default_route
+
+    out = {
+        "message": "Routing evaluated",
+        "route": decided["route"],
+        "skip_next_n": decided["skip_next_n"],
+        "stop_workflow": decided["stop_workflow"]
+    }
+
+    # Inject variables for downstream activities
+    vars_update = {k: v for k, v in decided.items() if v}
+
+    return ActivityResult(
+        status=ActivityStatus.COMPLETED,
+        output_data=out,
+        variables=vars_update
+    )
+
+
 async def process_condition_activity(
     activity: Dict[str, Any],
     context: WorkflowContext

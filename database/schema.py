@@ -279,6 +279,42 @@ CREATE INDEX IF NOT EXISTS idx_hl7_messages_created_at ON hl7_messages(created_a
 CREATE INDEX IF NOT EXISTS idx_user_sessions_token_hash ON user_sessions(token_hash);
 CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);
 
+-- Message Quarantine table
+CREATE TABLE IF NOT EXISTS message_quarantine (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
+    created_by_id UUID REFERENCES users(id),
+    original_message_id UUID REFERENCES hl7_messages(id),
+    raw_message TEXT NOT NULL,
+    reason_code VARCHAR(100) NOT NULL,
+    reason_detail JSONB,
+    status VARCHAR(20) DEFAULT 'PENDING',
+    target_workflow_id UUID REFERENCES workflows(id),
+    replayed_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_quarantine_tenant ON message_quarantine(tenant_id, status, created_at);
+
+-- DLQ (Dead Letter Queue) for failed workflow executions
+CREATE TABLE IF NOT EXISTS dlq_messages (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
+    workflow_id UUID REFERENCES workflows(id) ON DELETE CASCADE,
+    execution_id UUID,
+    activity_id UUID,
+    activity_name VARCHAR(200),
+    error_message TEXT,
+    payload JSONB,
+    retries INTEGER DEFAULT 0,
+    max_retries INTEGER DEFAULT 0,
+    next_attempt_at TIMESTAMP WITH TIME ZONE,
+    status VARCHAR(20) DEFAULT 'PENDING', -- PENDING|REQUEUED|RESOLVED|DELETED
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE
+);
+CREATE INDEX IF NOT EXISTS idx_dlq_tenant_status ON dlq_messages(tenant_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_dlq_next_attempt ON dlq_messages(next_attempt_at);
+
 -- CSV batch buffer table
 CREATE TABLE IF NOT EXISTS csv_batch_rows (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -370,7 +406,15 @@ async def create_tables():
         # Add 2FA columns to users table
         "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS two_factor_enabled BOOLEAN DEFAULT false",
         "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS two_factor_secret VARCHAR(32)",
-        "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS backup_codes JSONB DEFAULT '[]'"
+        "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS backup_codes JSONB DEFAULT '[]'",
+        # Add multi-format support to hl7_messages table
+        "ALTER TABLE IF EXISTS hl7_messages ADD COLUMN IF NOT EXISTS message_format VARCHAR(50) DEFAULT 'hl7'",
+        "ALTER TABLE IF EXISTS hl7_messages ADD COLUMN IF NOT EXISTS binary_payload BYTEA",
+        "ALTER TABLE IF EXISTS hl7_messages ADD COLUMN IF NOT EXISTS file_name VARCHAR(500)",
+        "ALTER TABLE IF EXISTS hl7_messages ADD COLUMN IF NOT EXISTS file_size INTEGER",
+        "ALTER TABLE IF EXISTS hl7_messages ADD COLUMN IF NOT EXISTS mime_type VARCHAR(100)",
+        # Make raw_message nullable for binary-only messages (e.g., DICOM)
+        "ALTER TABLE IF EXISTS hl7_messages ALTER COLUMN raw_message DROP NOT NULL"
     ]
 
     # Create user_memberships table if not exists (safe idempotent)
@@ -395,6 +439,12 @@ async def create_tables():
         except Exception as e:
             # Log but do not fail startup for non-critical migration errors
             print(f"Warning migrating: {stmt} - {e}")
+    # Add vendor ACK columns if missing
+    try:
+        await execute("ALTER TABLE IF EXISTS vendor_endpoints ADD COLUMN IF NOT EXISTS ack_on_receive BOOLEAN DEFAULT FALSE;")
+        await execute("ALTER TABLE IF EXISTS vendor_endpoints ADD COLUMN IF NOT EXISTS ack_profile VARCHAR(50) DEFAULT 'default';")
+    except Exception as e:
+        print(f"Warning migrating vendor ack columns: {e}")
 
 async def drop_tables():
     """Drop all tables (for development/testing)"""

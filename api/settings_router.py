@@ -53,6 +53,21 @@ class PlatformBranding(BaseModel):
     idle_warning_seconds: Optional[int] = None
 
 
+class MLLPConfig(BaseModel):
+    enabled: Optional[bool] = None
+    host: Optional[str] = None
+    port: Optional[int] = None
+    ack_mode: Optional[str] = None  # none|auto|accept
+    tenant_id: Optional[str] = None
+    tenant_slug: Optional[str] = None
+    vendor_slug: Optional[str] = None
+    tls_enabled: Optional[bool] = None
+    tls_cert_file: Optional[str] = None
+    tls_key_file: Optional[str] = None
+    tls_ca_file: Optional[str] = None
+    require_client_cert: Optional[bool] = None
+
+
 @router.get("/user")
 async def get_user_settings(current_user: Dict[str, Any] = Depends(get_current_user)):
     # Return a subset relevant for settings UI
@@ -238,6 +253,45 @@ def _read_platform_branding() -> Dict[str, Any]:
 def _write_platform_branding(data: Dict[str, Any]) -> None:
     BRANDING_PATH.parent.mkdir(parents=True, exist_ok=True)
     BRANDING_PATH.write_text(json.dumps(data, indent=2))
+
+
+@router.get('/mllp')
+async def get_mllp_settings(current_user: Dict[str, Any] = Depends(require_super_admin())):
+    """Get global MLLP listener configuration (super admin)."""
+    try:
+        cfg = await settings_service.get_system_setting('mllp_config', {})
+        # Merge with env defaults for visibility
+        merged = {
+            'enabled': bool((cfg or {}).get('enabled') or (os.getenv('MLLP_ENABLED', 'false').lower() == 'true')),
+            'host': (cfg or {}).get('host') or os.getenv('MLLP_HOST', '0.0.0.0'),
+            'port': int((cfg or {}).get('port') or os.getenv('MLLP_PORT', '2575')),
+            'ack_mode': (cfg or {}).get('ack_mode') or os.getenv('MLLP_ACK_MODE', 'auto'),
+            'tenant_id': (cfg or {}).get('tenant_id') or os.getenv('MLLP_TENANT_ID'),
+            'tenant_slug': (cfg or {}).get('tenant_slug') or os.getenv('MLLP_TENANT_SLUG'),
+            'vendor_slug': (cfg or {}).get('vendor_slug') or os.getenv('MLLP_VENDOR_SLUG'),
+            'tls_enabled': bool((cfg or {}).get('tls_enabled') or (os.getenv('MLLP_TLS_ENABLED', 'false').lower() == 'true')),
+            'tls_cert_file': (cfg or {}).get('tls_cert_file') or os.getenv('MLLP_TLS_CERT'),
+            'tls_key_file': (cfg or {}).get('tls_key_file') or os.getenv('MLLP_TLS_KEY'),
+            'tls_ca_file': (cfg or {}).get('tls_ca_file') or os.getenv('MLLP_TLS_CA'),
+            'require_client_cert': bool((cfg or {}).get('require_client_cert') or (os.getenv('MLLP_TLS_REQUIRE_CLIENT', 'false').lower() == 'true')),
+        }
+        return merged
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Failed to get MLLP settings: {e}')
+
+
+@router.patch('/mllp')
+async def update_mllp_settings(payload: MLLPConfig, current_user: Dict[str, Any] = Depends(require_super_admin())):
+    """Update global MLLP listener configuration (super admin)."""
+    try:
+        current = await settings_service.get_system_setting('mllp_config', {})
+        if not isinstance(current, dict):
+            current = {}
+        merged = {**current, **{k: v for k, v in payload.model_dump(exclude_unset=True).items()}}
+        await settings_service.set_system_setting('mllp_config', merged)
+        return {'updated': True, 'mllp_config': merged}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f'Failed to update MLLP settings: {e}')
 
 @router.get("/platform-branding")
 async def get_platform_branding(_: Dict[str, Any] = Depends(get_current_user)):

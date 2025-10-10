@@ -14,6 +14,7 @@ from datetime import datetime
 from models.workflow_models import WorkflowContext, ActivityResult, ActivityStatus
 from services.s3_service import s3_service
 from .gcs_storage_processor import process_gcs_storage_activity
+from services.secrets import resolve_secret
 
 logger = logging.getLogger(__name__)
 
@@ -211,8 +212,9 @@ async def process_s3_storage_activity(
 
     # Get AWS credentials from activity config (overrides environment)
     aws_config = config.get("aws", {})
-    aws_access_key = aws_config.get("access_key_id")
-    aws_secret_key = aws_config.get("secret_access_key")
+    # Resolve secrets (supports secret://ENV/VAR or secret://SYSTEM/key)
+    aws_access_key = await resolve_secret(aws_config.get("access_key_id"))
+    aws_secret_key = await resolve_secret(aws_config.get("secret_access_key"))
     aws_region = aws_config.get("region", "us-east-1")
 
     logger.info(f"S3 Storage Debug - AWS config: {aws_config}")

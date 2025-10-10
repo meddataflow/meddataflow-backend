@@ -110,16 +110,17 @@ async def get_dashboard_data(
         
         # Daily message counts for last N days, fill missing with zero
         from collections import defaultdict
+        interval_seconds = max(days - 1, 0) * 86400  # convert days to seconds
         rows = await fetch_all(
             """
             SELECT DATE_TRUNC('day', created_at) AS d, COUNT(*) AS c
             FROM hl7_messages
-            WHERE tenant_id = $1 AND created_at >= (DATE_TRUNC('day', NOW()) - INTERVAL '$2 days')
+            WHERE tenant_id = $1 AND created_at >= (DATE_TRUNC('day', NOW()) - ($2 * INTERVAL '1 second'))
             GROUP BY 1
             ORDER BY 1
             """,
             tenant_id,
-            days - 1,
+            interval_seconds,
         )
         counts = {r['d'].date().isoformat(): int(r['c']) for r in rows}
         daily_counts = []
@@ -130,7 +131,12 @@ async def get_dashboard_data(
         # Recent activity: last 10 events from messages and workflow executions
         recent_msgs = await fetch_all(
             """
-            SELECT 'message' AS kind, created_at, status, message_type AS title, message_control_id AS ref
+            SELECT 'message' AS kind,
+                   created_at,
+                   status,
+                   message_type AS title,
+                   id::text AS entity_id,
+                   message_control_id AS ref
             FROM hl7_messages
             WHERE tenant_id = $1
             ORDER BY created_at DESC
@@ -140,11 +146,16 @@ async def get_dashboard_data(
         )
         recent_execs = await fetch_all(
             """
-            SELECT 'workflow' AS kind, COALESCE(completed_at, started_at) AS created_at, status, w.name AS title, we.execution_id AS ref
+            SELECT 'workflow' AS kind,
+                   COALESCE(we.completed_at, we.started_at) AS created_at,
+                   we.status,
+                   w.name AS title,
+                   we.execution_id::text AS execution_id,
+                   we.workflow_id::text AS workflow_id
             FROM workflow_executions we
             JOIN workflows w ON w.id = we.workflow_id
             WHERE we.tenant_id = $1
-            ORDER BY COALESCE(completed_at, started_at) DESC
+            ORDER BY COALESCE(we.completed_at, we.started_at) DESC
             LIMIT 10
             """,
             tenant_id,
@@ -157,7 +168,10 @@ async def get_dashboard_data(
                 "timestamp": (r.get('created_at') or now).isoformat(),
                 "status": (r.get('status') or '').lower(),
                 "title": r.get('title') or '',
-                "ref": r.get('ref')
+                "ref": r.get('ref'),
+                "entity_id": r.get('entity_id'),
+                "workflow_id": r.get('workflow_id'),
+                "execution_id": r.get('execution_id'),
             }
         recent_activity = sorted([_row_to_activity(r) for r in combined], key=lambda x: x['timestamp'], reverse=True)[:10]
 

@@ -105,7 +105,10 @@ class HL7MessageRepository:
         conditions = ["m.tenant_id = $1"]
         params = [tenant_id]
         param_count = 2
-        
+
+        # HL7 view should only surface true HL7 records (legacy rows have NULL format)
+        conditions.append("(m.message_format IS NULL OR m.message_format = 'hl7')")
+
         if status:
             conditions.append(f"m.status = ${param_count}")
             params.append(status.value)
@@ -220,6 +223,26 @@ class HL7MessageRepository:
             query, parsed_message, english_translation, 
             datetime.now(timezone.utc), message_id
         )
+
+    @staticmethod
+    async def find_recent_by_control_id(
+        tenant_id: uuid.UUID,
+        message_control_id: str,
+        window_minutes: int = 1440
+    ) -> Optional[Dict[str, Any]]:
+        """Find the most recent message with the same control ID within a window."""
+        if not message_control_id:
+            return None
+        query = """
+        SELECT *
+        FROM hl7_messages
+        WHERE tenant_id = $1
+          AND message_control_id = $2
+          AND created_at >= NOW() - ($3::text || ' minutes')::interval
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+        return await fetch_one(query, tenant_id, message_control_id, str(window_minutes))
     
     @staticmethod
     async def get_message_stats(tenant_id: uuid.UUID) -> Dict[str, Any]:

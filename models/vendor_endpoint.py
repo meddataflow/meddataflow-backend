@@ -31,13 +31,15 @@ class VendorEndpointRepository:
             "vendor_contact_email", "vendor_contact_phone", "api_key", "message_format",
             "max_message_size", "rate_limit_per_hour", "is_active", "require_ssl",
             "allowed_ip_ranges", "ignored_message_types", "total_messages_received", "total_messages_processed",
-            "total_messages_failed", "created_at", "updated_at"
+            "total_messages_failed", "created_at", "updated_at",
+            "ack_on_receive", "ack_profile"
         ]
         values = [
             endpoint_id, tenant_id, vendor_slug, vendor_name, vendor_description,
             vendor_contact_email, vendor_contact_phone, api_key, message_format,
             max_message_size, rate_limit_per_hour, True, True,
-            json.dumps([]), json.dumps([]), 0, 0, 0, now, now
+            json.dumps([]), json.dumps([]), 0, 0, 0, now, now,
+            False, 'default'
         ]
         placeholders = [f"${i+1}" for i in range(len(fields))]
         query = f"""
@@ -144,7 +146,7 @@ class VendorEndpointRepository:
             'vendor_slug', 'vendor_name', 'vendor_description', 'vendor_contact_email',
             'vendor_contact_phone', 'api_key', 'message_format', 'max_message_size',
             'rate_limit_per_hour', 'is_active', 'require_ssl', 'allowed_ip_ranges',
-            'ignored_message_types',
+            'ignored_message_types', 'ack_on_receive', 'ack_profile',
             'trigger_workflow_id'
         ]
         

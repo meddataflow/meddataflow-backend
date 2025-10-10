@@ -36,6 +36,58 @@ def _normalize_list_field(value) -> List[str]:
     # Unknown type
     return []
 
+SUPPORTED_MESSAGE_FORMATS = {
+    "hl7",
+    "fhir",
+    "dicom",
+    "ncpdp",
+    "x12",
+    "cda",
+    "ccd",
+    "ccr",
+    "terminology"
+}
+
+MESSAGE_FORMAT_ALIASES = {
+    "hl7_v2": "hl7",
+    "hl7v2": "hl7",
+    "hl7": "hl7",
+    "fhir_json": "fhir",
+    "json_fhir": "fhir",
+    "fhir": "fhir",
+    "dicomweb": "dicom",
+    "dicom": "dicom",
+    "ncpdp": "ncpdp",
+    "script": "ncpdp",
+    "x12": "x12",
+    "edi": "x12",
+    "cda": "cda",
+    "ccd": "ccd",
+    "ccr": "ccr",
+    "terminology": "terminology",
+    "codes": "terminology",
+    "json": "terminology",
+    "xml": "cda"
+}
+
+
+def normalize_message_format(value: Optional[str]) -> str:
+    raw = (value or "hl7").strip().lower()
+    normalized = MESSAGE_FORMAT_ALIASES.get(raw, raw)
+    if normalized not in SUPPORTED_MESSAGE_FORMATS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported message format '{value}'. Supported values: {', '.join(sorted(SUPPORTED_MESSAGE_FORMATS))}"
+        )
+    return normalized
+
+
+def safe_normalize_message_format(value: Optional[str]) -> str:
+    try:
+        return normalize_message_format(value)
+    except HTTPException:
+        return "hl7"
+
 # Pydantic models
 class VendorEndpointStatistics(BaseModel):
     total_received: int
@@ -65,6 +117,8 @@ class VendorEndpointResponse(BaseModel):
     updated_at: datetime
     trigger_workflow_id: Optional[str] = None
     trigger_workflow_name: Optional[str] = None
+    ack_on_receive: Optional[bool] = False
+    ack_profile: Optional[str] = None
 
 class VendorEndpointCreate(BaseModel):
     vendor_slug: str
@@ -88,6 +142,8 @@ class VendorEndpointUpdate(BaseModel):
     require_ssl: Optional[bool] = None
     trigger_workflow_id: Optional[str] = None
     ignored_message_types: Optional[List[str]] = None
+    ack_on_receive: Optional[bool] = None
+    ack_profile: Optional[str] = None
 
 def calculate_endpoint_statistics(endpoint):
     """Calculate endpoint statistics for frontend display"""
@@ -136,11 +192,13 @@ async def get_vendor_endpoints(
                 vendor_contact_email=ep.get('vendor_contact_email'),
                 vendor_contact_phone=ep.get('vendor_contact_phone'),
                 api_key=ep.get('api_key'),
-                message_format=ep['message_format'],
+                message_format=safe_normalize_message_format(ep.get('message_format')),
                 max_message_size=ep['max_message_size'],
                 rate_limit_per_hour=ep['rate_limit_per_hour'],
                 is_active=ep['is_active'],
                 require_ssl=ep['require_ssl'],
+                ack_on_receive=ep.get('ack_on_receive', False),
+                ack_profile=ep.get('ack_profile'),
                 ignored_message_types=_normalize_list_field(ep.get('ignored_message_types')),
                 total_messages_received=ep.get('computed_total_messages') or ep.get('total_messages_received', 0),
                 total_messages_processed=ep.get('computed_processed_messages') or ep.get('total_messages_processed', 0),
@@ -187,6 +245,8 @@ async def get_vendor_endpoint(
                 detail="Vendor endpoint not found"
             )
             
+        normalized_format = safe_normalize_message_format(endpoint.get('message_format'))
+
         return VendorEndpointResponse(
             id=str(endpoint['id']),
             vendor_slug=endpoint['vendor_slug'],
@@ -195,11 +255,13 @@ async def get_vendor_endpoint(
             vendor_contact_email=endpoint.get('vendor_contact_email'),
             vendor_contact_phone=endpoint.get('vendor_contact_phone'),
             api_key=endpoint.get('api_key'),
-            message_format=endpoint['message_format'],
+            message_format=normalized_format,
             max_message_size=endpoint['max_message_size'],
             rate_limit_per_hour=endpoint['rate_limit_per_hour'],
             is_active=endpoint['is_active'],
             require_ssl=endpoint['require_ssl'],
+            ack_on_receive=endpoint.get('ack_on_receive', False),
+            ack_profile=endpoint.get('ack_profile'),
             ignored_message_types=_normalize_list_field(endpoint.get('ignored_message_types')),
             total_messages_received=endpoint.get('computed_total_messages') or endpoint.get('total_messages_received', 0),
             total_messages_processed=endpoint.get('computed_processed_messages') or endpoint.get('total_messages_processed', 0),
@@ -240,6 +302,8 @@ async def create_vendor_endpoint(
         if isinstance(tenant_id, str):
             tenant_id = uuid.UUID(tenant_id)
             
+        normalized_format = normalize_message_format(endpoint_data.message_format)
+
         # Check if slug already exists for this tenant
         if not await VendorEndpointRepository.validate_slug(tenant_id, endpoint_data.vendor_slug):
             raise HTTPException(
@@ -255,11 +319,11 @@ async def create_vendor_endpoint(
             vendor_contact_email=str(endpoint_data.vendor_contact_email) if endpoint_data.vendor_contact_email else None,
             vendor_contact_phone=endpoint_data.vendor_contact_phone,
             api_key=str(uuid.uuid4()),
-            message_format=endpoint_data.message_format,
+            message_format=normalized_format,
             max_message_size=endpoint_data.max_message_size,
             rate_limit_per_hour=endpoint_data.rate_limit_per_hour
         )
-        
+
         return VendorEndpointResponse(
             id=str(endpoint['id']),
             vendor_slug=endpoint['vendor_slug'],
@@ -268,11 +332,13 @@ async def create_vendor_endpoint(
             vendor_contact_email=endpoint.get('vendor_contact_email'),
             vendor_contact_phone=endpoint.get('vendor_contact_phone'),
             api_key=endpoint.get('api_key'),
-            message_format=endpoint['message_format'],
+            message_format=normalized_format,
             max_message_size=endpoint['max_message_size'],
             rate_limit_per_hour=endpoint['rate_limit_per_hour'],
             is_active=endpoint['is_active'],
             require_ssl=endpoint['require_ssl'],
+            ack_on_receive=endpoint.get('ack_on_receive', False),
+            ack_profile=endpoint.get('ack_profile'),
             ignored_message_types=_normalize_list_field(endpoint.get('ignored_message_types')),
             total_messages_received=endpoint.get('computed_total_messages') or endpoint.get('total_messages_received', 0),
             total_messages_processed=endpoint.get('computed_processed_messages') or endpoint.get('total_messages_processed', 0),
@@ -335,7 +401,9 @@ async def update_vendor_endpoint(
                     update_data[field] = value
             
         endpoint = await VendorEndpointRepository.update_endpoint(endpoint_uuid, **update_data)
-        
+
+        normalized_format = safe_normalize_message_format(endpoint.get('message_format'))
+
         return VendorEndpointResponse(
             id=str(endpoint['id']),
             vendor_slug=endpoint['vendor_slug'],
@@ -344,7 +412,7 @@ async def update_vendor_endpoint(
             vendor_contact_email=endpoint.get('vendor_contact_email'),
             vendor_contact_phone=endpoint.get('vendor_contact_phone'),
             api_key=endpoint.get('api_key'),
-            message_format=endpoint['message_format'],
+            message_format=normalized_format,
             max_message_size=endpoint['max_message_size'],
             rate_limit_per_hour=endpoint['rate_limit_per_hour'],
             is_active=endpoint['is_active'],
@@ -455,6 +523,8 @@ async def regenerate_api_key(
         # Update with new API key
         endpoint = await VendorEndpointRepository.update_endpoint(endpoint_uuid, api_key=new_api_key)
 
+        normalized_format = safe_normalize_message_format(endpoint.get('message_format'))
+
         return VendorEndpointResponse(
             id=str(endpoint['id']),
             vendor_slug=endpoint['vendor_slug'],
@@ -463,7 +533,7 @@ async def regenerate_api_key(
             vendor_contact_email=endpoint.get('vendor_contact_email'),
             vendor_contact_phone=endpoint.get('vendor_contact_phone'),
             api_key=endpoint.get('api_key'),
-            message_format=endpoint['message_format'],
+            message_format=normalized_format,
             max_message_size=endpoint['max_message_size'],
             rate_limit_per_hour=endpoint['rate_limit_per_hour'],
             is_active=endpoint['is_active'],

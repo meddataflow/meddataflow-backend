@@ -552,3 +552,103 @@ async def process_databricks_sender_activity(activity: Dict[str, Any], context: 
             status=ActivityStatus.FAILED,
             error_message=f"Databricks sending failed: {str(e)}"
         )
+
+
+async def process_sqs_producer_activity(activity: Dict[str, Any], context: WorkflowContext) -> ActivityResult:
+    from services.secrets import resolve_secret
+    cfg = activity.get('config', {}) or {}
+    queue_url = cfg.get('queue_url')
+    queue_name = cfg.get('queue_name')
+    region = cfg.get('region') or (cfg.get('aws') or {}).get('region') or 'us-east-1'
+    body_template = cfg.get('body_template') or ''
+    attributes_cfg = cfg.get('attributes') or {}
+    aws = cfg.get('aws') or {}
+    ak = await resolve_secret(aws.get('access_key_id'))
+    sk = await resolve_secret(aws.get('secret_access_key'))
+
+    try:
+        import boto3
+    except Exception as e:
+        return ActivityResult(status=ActivityStatus.FAILED, error_message=f"boto3 unavailable: {e}")
+
+    def render(tpl: str) -> str:
+        out = tpl or ''
+        for k, v in context.variables.items():
+            out = out.replace(f"{{{k}}}", str(v)).replace(f"{{{{{k}}}}}", str(v))
+        return out
+
+    session_kwargs = { 'region_name': region }
+    if ak and sk:
+        session_kwargs.update({ 'aws_access_key_id': ak, 'aws_secret_access_key': sk })
+    sqs = boto3.client('sqs', **session_kwargs)
+
+    if not queue_url and queue_name:
+        try:
+            q = sqs.get_queue_url(QueueName=queue_name)
+            queue_url = q.get('QueueUrl')
+        except Exception as e:
+            return ActivityResult(status=ActivityStatus.FAILED, error_message=f"Failed to resolve queue: {e}")
+    if not queue_url:
+        return ActivityResult(status=ActivityStatus.FAILED, error_message="No queue_url or queue_name provided")
+
+    body = render(body_template)
+    message_attributes = { k: { 'DataType': 'String', 'StringValue': render(str(v)) } for k, v in attributes_cfg.items() }
+    try:
+        resp = sqs.send_message(QueueUrl=queue_url, MessageBody=body, MessageAttributes=message_attributes)
+        mid = resp.get('MessageId')
+        return ActivityResult(status=ActivityStatus.COMPLETED, output_data={ 'message_id': mid, 'queue_url': queue_url }, variables={ 'sqs_message_id': mid })
+    except Exception as e:
+        return ActivityResult(status=ActivityStatus.FAILED, error_message=f"SQS send failed: {e}")
+
+
+async def process_sqs_consumer_activity(activity: Dict[str, Any], context: WorkflowContext) -> ActivityResult:
+    from services.secrets import resolve_secret
+    cfg = activity.get('config', {}) or {}
+    queue_url = cfg.get('queue_url')
+    queue_name = cfg.get('queue_name')
+    region = cfg.get('region') or (cfg.get('aws') or {}).get('region') or 'us-east-1'
+    max_messages = int(cfg.get('max_messages') or 1)
+    wait_seconds = int(cfg.get('wait_seconds') or 0)
+    delete_after = bool(cfg.get('delete_after'))
+    aws = cfg.get('aws') or {}
+    ak = await resolve_secret(aws.get('access_key_id'))
+    sk = await resolve_secret(aws.get('secret_access_key'))
+
+    try:
+        import boto3
+    except Exception as e:
+        return ActivityResult(status=ActivityStatus.FAILED, error_message=f"boto3 unavailable: {e}")
+
+    session_kwargs = { 'region_name': region }
+    if ak and sk:
+        session_kwargs.update({ 'aws_access_key_id': ak, 'aws_secret_access_key': sk })
+    sqs = boto3.client('sqs', **session_kwargs)
+
+    if not queue_url and queue_name:
+        try:
+            q = sqs.get_queue_url(QueueName=queue_name)
+            queue_url = q.get('QueueUrl')
+        except Exception as e:
+            return ActivityResult(status=ActivityStatus.FAILED, error_message=f"Failed to resolve queue: {e}")
+    if not queue_url:
+        return ActivityResult(status=ActivityStatus.FAILED, error_message="No queue_url or queue_name provided")
+
+    try:
+        resp = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=max_messages, WaitTimeSeconds=wait_seconds, MessageAttributeNames=['All'])
+        messages = resp.get('Messages') or []
+        out = []
+        for m in messages:
+            body = m.get('Body')
+            attrs = m.get('MessageAttributes') or {}
+            out.append({ 'id': m.get('MessageId'), 'body': body, 'attributes': attrs })
+            if delete_after and m.get('ReceiptHandle'):
+                try:
+                    sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=m['ReceiptHandle'])
+                except Exception:
+                    pass
+        variables = { 'sqs_messages': out }
+        if out and not context.raw_message:
+            variables['message'] = out[0]['body']
+        return ActivityResult(status=ActivityStatus.COMPLETED, output_data={ 'received': len(out) }, variables=variables)
+    except Exception as e:
+        return ActivityResult(status=ActivityStatus.FAILED, error_message=f"SQS receive failed: {e}")

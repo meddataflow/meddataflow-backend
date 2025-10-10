@@ -242,12 +242,88 @@ async def ensure_database():
         tenants = await TenantRepository.get_all_tenants()
         if tenants:
             print("✅ Database already initialized; skipping seeding")
+            # Even if initialized, ensure core accounts exist / updated
+            await ensure_core_accounts()
             return
     finally:
         await close_connection_pool()
 
     # If no tenants, run full seed
     await seed_database()
+    # After seed, ensure core accounts reflect desired domain/passwords
+    await ensure_core_accounts()
+
+async def ensure_core_accounts():
+    """Ensure core users exist with desired domain and strong passwords.
+    Controlled via environment variables:
+    - SEED_USER_DOMAIN (default: meddataflow.com)
+    - SEED_FORCE_UPDATE_USERS (true/false) to reset passwords if user exists
+    - ADMIN_PASSWORD, WORKFLOW_ADMIN_PASSWORD, ANALYST_PASSWORD, SUPERADMIN_PASSWORD to set strong passwords
+    - SEED_TENANT_SLUG to select tenant (default: first active tenant or 'demo' if present)
+    """
+    import os
+    import secrets
+    try:
+        await create_connection_pool()
+
+        # Determine target tenant
+        tenant_slug = os.getenv("SEED_TENANT_SLUG", "demo")
+        tenant = await TenantRepository.get_tenant_by_slug(tenant_slug)
+        if not tenant:
+            tenants = await TenantRepository.get_all_tenants()
+            tenant = tenants[0] if tenants else None
+        if not tenant:
+            print("⚠️ No tenant found to attach users to; skipping ensure_core_accounts")
+            return
+
+        tenant_id = tenant["id"]
+        domain = os.getenv("SEED_USER_DOMAIN", "meddataflow.com").strip()
+        force_update = os.getenv("SEED_FORCE_UPDATE_USERS", "false").lower() in ("1", "true", "yes")
+
+        users_spec = [
+            {"email": f"admin@{domain}", "password_env": "ADMIN_PASSWORD", "role": UserRole.TENANT_ADMIN, "tenant_id": tenant_id, "first_name": "Admin", "last_name": "MedDataFlow"},
+            {"email": f"workflows@{domain}", "password_env": "WORKFLOW_ADMIN_PASSWORD", "role": UserRole.WORKFLOW_ADMIN, "tenant_id": tenant_id, "first_name": "Workflow", "last_name": "Admin"},
+            {"email": f"analyst@{domain}", "password_env": "ANALYST_PASSWORD", "role": UserRole.ANALYST, "tenant_id": tenant_id, "first_name": "Data", "last_name": "Analyst"},
+            {"email": f"superadmin@{domain}", "password_env": "SUPERADMIN_PASSWORD", "role": UserRole.SUPER_ADMIN, "tenant_id": None, "first_name": "Super", "last_name": "Admin"},
+        ]
+
+        log_pw = os.getenv("SEED_LOG_PASSWORDS", "false").lower() in ("1", "true", "yes")
+
+        for spec in users_spec:
+            desired_email = spec["email"].lower()
+            existing = await UserRepository.get_user_by_email(desired_email)
+            if not existing:
+                # Create with strong password (env or random)
+                pwd = os.getenv(spec["password_env"]) or secrets.token_urlsafe(24)
+                created = await UserRepository.create_user(
+                    email=desired_email,
+                    password=pwd,
+                    first_name=spec["first_name"],
+                    last_name=spec["last_name"],
+                    tenant_id=spec["tenant_id"],
+                    role=spec["role"],
+                )
+                print(f"✅ Ensured user: {desired_email}")
+                if log_pw:
+                    print(f"🔐 Initial password for {desired_email}: {pwd}")
+            else:
+                if force_update:
+                    # Reset password if provided via env
+                    pwd = os.getenv(spec["password_env"]) or None
+                    if pwd:
+                        await UserRepository.update_password(existing["id"], pwd)
+                        print(f"🔐 Updated password for {desired_email}")
+                        if log_pw:
+                            print(f"🔐 New password for {desired_email}: {pwd}")
+                # Ensure role matches desired
+                if existing.get("role") != spec["role"].value:
+                    await UserRepository.update_user(existing["id"], role=spec["role"].value)
+                    print(f"🔧 Updated role for {desired_email} -> {spec['role'].value}")
+
+    except Exception as e:
+        print(f"⚠️ ensure_core_accounts encountered an issue: {e}")
+    finally:
+        await close_connection_pool()
 
 if __name__ == "__main__":
     import sys

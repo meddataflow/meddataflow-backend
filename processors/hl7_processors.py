@@ -13,6 +13,7 @@ from typing import Tuple
 
 from models.workflow_models import WorkflowContext, ActivityResult, ActivityStatus
 from services.hl7_parser import HL7Parser, ParsedHL7Message
+from services.hl7_ack import generate_ack
 from services.hl7_mapper_service import hl7_mapper_service
 from services.generic_hl7_mapper import generic_hl7_mapper
 
@@ -1242,6 +1243,35 @@ async def _create_diagnostic_report_from_obr(obr_segment: str, index: int, patie
             diagnostic_report["effectiveDateTime"] = formatted_datetime
 
     return diagnostic_report
+
+
+async def process_hl7_ack_activity(activity: Dict[str, Any], context: WorkflowContext) -> ActivityResult:
+    """Generate an HL7 ACK/NACK for the current raw message.
+
+    Config:
+      - code: 'AA' | 'AE' | 'AR' (default 'AA')
+      - include_err: boolean (default false)
+      - error_text: string (included when include_err=true and code != 'AA')
+      - profile: string (reserved)
+    """
+    cfg = activity.get('config', {}) or {}
+    code = str(cfg.get('code') or 'AA').upper()
+    include_err = bool(cfg.get('include_err', False))
+    error_text = str(cfg.get('error_text') or '') if include_err and code in ('AE', 'AR') else None
+    profile = str(cfg.get('profile') or 'default')
+
+    if not context.raw_message:
+        return ActivityResult(status=ActivityStatus.FAILED, error_message='No raw HL7 message to ACK')
+
+    try:
+        ack = generate_ack(context.raw_message, code=code, error_text=error_text, profile=profile)
+        return ActivityResult(
+            status=ActivityStatus.COMPLETED,
+            output_data={'ack_message': ack, 'ack_code': code, 'profile': profile},
+            variables={'ack_message': ack, 'ack_code': code}
+        )
+    except Exception as e:
+        return ActivityResult(status=ActivityStatus.FAILED, error_message=str(e))
 
 
 async def _create_service_request_from_orc(orc_segment: str, index: int, patient_resource: Dict[str, Any]) -> Dict[str, Any]:

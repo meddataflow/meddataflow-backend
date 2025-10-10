@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime
 import uuid
 import json
@@ -13,13 +13,58 @@ from models.tenant import TenantRepository
 
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/vendor", tags=["Vendor HL7 Ingestion"])
+router = APIRouter(prefix="/api/vendor", tags=["Vendor Message Ingestion"])
 
 # Security scheme for API key
 security = HTTPBearer()
 
 # Global instances
 hl7_parser = HL7Parser()
+
+SUPPORTED_MESSAGE_FORMATS = {
+    "hl7",
+    "fhir",
+    "dicom",
+    "ncpdp",
+    "x12",
+    "cda",
+    "ccd",
+    "ccr",
+    "terminology"
+}
+
+MESSAGE_FORMAT_ALIASES = {
+    "hl7_v2": "hl7",
+    "hl7v2": "hl7",
+    "hl7": "hl7",
+    "fhir_json": "fhir",
+    "json_fhir": "fhir",
+    "fhir": "fhir",
+    "dicomweb": "dicom",
+    "dicom": "dicom",
+    "ncpdp": "ncpdp",
+    "script": "ncpdp",
+    "x12": "x12",
+    "edi": "x12",
+    "cda": "cda",
+    "ccd": "ccd",
+    "ccr": "ccr",
+    "terminology": "terminology",
+    "codes": "terminology",
+    "json": "terminology",
+    "xml": "cda"
+}
+
+
+def normalize_ingestion_format(value: Optional[str]) -> str:
+    raw = (value or "hl7").strip().lower()
+    normalized = MESSAGE_FORMAT_ALIASES.get(raw, raw)
+    if normalized not in SUPPORTED_MESSAGE_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported message format '{value}'. Supported: {', '.join(sorted(SUPPORTED_MESSAGE_FORMATS))}"
+        )
+    return normalized
 
 async def validate_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
     """
@@ -42,7 +87,11 @@ async def validate_api_key(credentials: HTTPAuthorizationCredentials = Depends(s
     
     if not vendor_endpoint:
         raise HTTPException(status_code=401, detail="Invalid or inactive API key")
-    
+    try:
+        normalized_format = normalize_ingestion_format(vendor_endpoint.get('message_format'))
+    except HTTPException:
+        normalized_format = "hl7"
+
     return {
         "vendor_endpoint_id": vendor_endpoint['id'],
         "vendor_slug": vendor_endpoint['vendor_slug'],
@@ -51,9 +100,11 @@ async def validate_api_key(credentials: HTTPAuthorizationCredentials = Depends(s
         "tenant_name": vendor_endpoint['tenant_name'],
         "tenant_slug": vendor_endpoint['tenant_slug'],
         "trigger_workflow_id": vendor_endpoint['trigger_workflow_id'],
-        "message_format": vendor_endpoint['message_format'],
+        "message_format": normalized_format,
         "max_message_size": vendor_endpoint['max_message_size'],
-        "rate_limit_per_hour": vendor_endpoint['rate_limit_per_hour']
+        "rate_limit_per_hour": vendor_endpoint['rate_limit_per_hour'],
+        "ack_on_receive": vendor_endpoint.get('ack_on_receive', False),
+        "ack_profile": vendor_endpoint.get('ack_profile')
     }
 
 async def check_rate_limit(vendor_info: Dict[str, Any], request: Request) -> bool:
@@ -82,9 +133,10 @@ async def check_rate_limit(vendor_info: Dict[str, Any], request: Request) -> boo
     
     return True
 
-@router.post("/{vendor_slug}/hl7/ingest")
-async def ingest_hl7_message(
+@router.post("/{vendor_slug}/{format_slug}/ingest")
+async def ingest_vendor_message(
     vendor_slug: str,
+    format_slug: str,
     request: Request,
     background_tasks: BackgroundTasks,
     raw_message: str,
@@ -115,20 +167,28 @@ async def ingest_hl7_message(
             detail=f"Message too large: {message_size} bytes (max: {max_size} bytes)"
         )
 
-    # Basic HL7 format validation
-    if not raw_message.startswith('MSH|'):
-        raise HTTPException(status_code=400, detail="Invalid HL7 message format")
-
-    # Check for suspicious content
+    # Check for suspicious content (applies to all formats)
     if any(suspicious in raw_message.lower() for suspicious in ['<script', 'javascript:', 'eval(', 'exec(']):
-        logger.warning(f"Suspicious content detected in HL7 message from {vendor_info['vendor_slug']}")
+        logger.warning(f"Suspicious content detected in message from {vendor_info['vendor_slug']}")
         raise HTTPException(status_code=400, detail="Message contains suspicious content")
     
     try:
         # Verify vendor slug matches the API key
         if vendor_slug != vendor_info['vendor_slug']:
             raise HTTPException(status_code=403, detail="Vendor slug does not match API key")
-        
+
+        path_message_format = normalize_ingestion_format(format_slug)
+        vendor_configured_format = normalize_ingestion_format(vendor_info.get('message_format'))
+
+        if path_message_format != vendor_configured_format:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Vendor expects {vendor_configured_format.upper()} messages, but endpoint path requested {path_message_format.upper()}"
+            )
+
+        message_format = vendor_configured_format
+        vendor_info = {**vendor_info, 'message_format': message_format}
+
         # Check rate limiting
         if not await check_rate_limit(vendor_info, request):
             raise HTTPException(
@@ -164,25 +224,7 @@ async def ingest_hl7_message(
                 status_code=413, 
                 detail=f"Message size {message_size} bytes exceeds limit of {max_size} bytes"
             )
-        
-        # Validate message format
-        if vendor_info['message_format'] != 'hl7':
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Expected HL7 format, but vendor is configured for {vendor_info['message_format']}"
-            )
-        
-        # Parse HL7 message for basic validation
-        try:
-            parsed_message = hl7_parser.parse_message(raw_message)
-            validation_errors = hl7_parser.validate_message(parsed_message)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid HL7 message: {str(e)}")
-        
-        # Generate message ID
-        message_id = uuid.uuid4()
-        
-        # Store HL7 message in database
+
         insert_query = """
         INSERT INTO hl7_messages (
             id, tenant_id, vendor_endpoint_id, message_control_id,
@@ -192,7 +234,29 @@ async def ingest_hl7_message(
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
         RETURNING *
         """
-        
+
+        if message_format != 'hl7':
+            return await _process_non_hl7_message(
+                insert_query,
+                vendor_slug,
+                raw_message,
+                vendor_info,
+                message_format
+            )
+
+        # HL7-specific validation
+        if not raw_message.startswith('MSH|'):
+            raise HTTPException(status_code=400, detail="Invalid HL7 message format")
+
+        try:
+            parsed_message = hl7_parser.parse_message(raw_message)
+            validation_errors = hl7_parser.validate_message(parsed_message)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid HL7 message: {str(e)}")
+
+        # Generate message ID
+        message_id = uuid.uuid4()
+
         # Extract key fields from parsed message
         message_control_id = parsed_message.message_control_id
         message_type = parsed_message.message_type
@@ -202,7 +266,7 @@ async def ingest_hl7_message(
         sending_facility = getattr(parsed_message, 'sending_facility', '')
         receiving_application = getattr(parsed_message, 'receiving_application', '')
         receiving_facility = getattr(parsed_message, 'receiving_facility', '')
-        
+
         # Convert parsed message to JSON for storage
         parsed_message_json = {
             "message_type": message_type,
@@ -210,7 +274,7 @@ async def ingest_hl7_message(
             "version": hl7_version,
             "segments": []
         }
-        
+
         for segment in parsed_message.segments:
             segment_data = {
                 "type": segment.type,
@@ -226,7 +290,7 @@ async def ingest_hl7_message(
                 }
                 segment_data["fields"].append(field_data)
             parsed_message_json["segments"].append(segment_data)
-        
+
         # Insert message
         stored_message = await execute(
             insert_query,
@@ -258,7 +322,7 @@ async def ingest_hl7_message(
         WHERE id = $1
         """
         await execute(stats_update_query, vendor_info['vendor_endpoint_id'], datetime.utcnow())
-        
+
         # Prepare response
         response_data = {
             "status": "success",
@@ -272,9 +336,27 @@ async def ingest_hl7_message(
             "vendor_info": {
                 "vendor_slug": vendor_info['vendor_slug'],
                 "vendor_name": vendor_info['vendor_name'],
-                "tenant_slug": vendor_info['tenant_slug']
+                "tenant_slug": vendor_info['tenant_slug'],
+                "message_format": vendor_info['message_format']
             }
         }
+
+        # Optionally return HL7 ACK directly for clients that expect it
+        try:
+            if bool(vendor_info.get('ack_on_receive')):
+                from fastapi.responses import PlainTextResponse
+                from services.hl7_ack import generate_ack
+                code = 'AA' if not validation_errors else 'AE'
+                ack_text = generate_ack(raw_message, code=code, error_text=(validation_errors[0] if validation_errors else None), profile=str(vendor_info.get('ack_profile') or 'default'))
+                # If client prefers text/plain via Accept header or query param format=hl7, return ACK text
+                accept = request.headers.get('accept', '')
+                fmt = request.query_params.get('format')
+                if 'text/plain' in accept or (fmt and fmt.lower() in ('hl7', 'ack')):
+                    return PlainTextResponse(content=ack_text, media_type='text/plain')
+                else:
+                    response_data['ack'] = ack_text
+        except Exception:
+            pass
         
         # Trigger workflow if configured (using queue service)
         if vendor_info['trigger_workflow_id']:
@@ -305,6 +387,135 @@ async def ingest_hl7_message(
     except Exception as e:
         logger.error(f"Unexpected error processing HL7 message from vendor {vendor_slug}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error processing message")
+
+
+async def _process_non_hl7_message(
+    insert_query: str,
+    vendor_slug: str,
+    raw_message: str,
+    vendor_info: Dict[str, Any],
+    message_format: str
+):
+    """Handle ingestion for non-HL7 message formats."""
+
+    message_id = uuid.uuid4()
+    message_control_id = str(uuid.uuid4())
+    message_type = message_format.upper()
+    validation_errors: List[str] = []
+
+    metadata: Dict[str, Any] = {
+        "format": message_format,
+        "ingested_at": datetime.utcnow().isoformat()
+    }
+
+    try:
+        if message_format == 'fhir':
+            resource = json.loads(raw_message)
+            resource_type = resource.get('resourceType', 'Resource')
+            message_type = f"FHIR:{resource_type}"
+            message_control_id = resource.get('id', message_control_id)
+            metadata.update({
+                "resourceType": resource_type,
+                "id": resource.get('id'),
+                "meta": resource.get('meta')
+            })
+        elif message_format == 'x12':
+            metadata.update({
+                "segment_count": raw_message.count('~') + 1 if '~' in raw_message else 1
+            })
+        elif message_format == 'ncpdp':
+            metadata.update({
+                "field_delimiter": '|'
+            })
+        elif message_format in {'cda', 'ccd', 'ccr'}:
+            metadata.update({
+                "document_hint": message_format.upper()
+            })
+        elif message_format == 'terminology':
+            try:
+                sample = json.loads(raw_message)
+                metadata.update({
+                    "code": sample.get('code'),
+                    "system": sample.get('system'),
+                    "display": sample.get('display')
+                })
+            except json.JSONDecodeError:
+                metadata.update({
+                    "note": "Terminology payload stored as raw text"
+                })
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid {message_format.upper()} payload: {str(exc)}")
+
+    metadata["byte_size"] = len(raw_message.encode('utf-8'))
+
+    await execute(
+        insert_query,
+        message_id,
+        vendor_info['tenant_id'],
+        vendor_info['vendor_endpoint_id'],
+        message_control_id,
+        message_type,
+        None,
+        None,
+        raw_message,
+        json.dumps({"format": message_format, "metadata": metadata}),
+        vendor_info.get('vendor_name', ''),
+        '',
+        vendor_info.get('tenant_slug', ''),
+        '',
+        'RECEIVED',
+        'INBOUND',
+        None,
+        f"vendor:{vendor_slug}",
+        datetime.utcnow()
+    )
+
+    stats_update_query = """
+    UPDATE vendor_endpoints 
+    SET total_messages_received = total_messages_received + 1,
+        updated_at = $2
+    WHERE id = $1
+    """
+    await execute(stats_update_query, vendor_info['vendor_endpoint_id'], datetime.utcnow())
+
+    response_data = {
+        "status": "success",
+        "message": f"{message_format.upper()} message received",
+        "message_id": str(message_id),
+        "message_control_id": message_control_id,
+        "message_type": message_type,
+        "validation_errors": validation_errors,
+        "is_valid": len(validation_errors) == 0,
+        "received_at": datetime.utcnow().isoformat(),
+        "vendor_info": {
+            "vendor_slug": vendor_info['vendor_slug'],
+            "vendor_name": vendor_info['vendor_name'],
+            "tenant_slug": vendor_info['tenant_slug'],
+            "message_format": vendor_info['message_format']
+        }
+    }
+
+    if vendor_info['trigger_workflow_id']:
+        try:
+            task_id = await queue_service.enqueue_workflow_execution(
+                workflow_id=vendor_info['trigger_workflow_id'],
+                message_id=str(message_id),
+                raw_message=raw_message,
+                vendor_info=vendor_info,
+                priority=3
+            )
+            response_data["workflow_triggered"] = True
+            response_data["workflow_id"] = vendor_info['trigger_workflow_id']
+            response_data["task_id"] = task_id
+        except Exception as exc:
+            logger.error(f"Failed to enqueue workflow execution for non-HL7 message: {exc}")
+            response_data["workflow_triggered"] = False
+            response_data["workflow_error"] = str(exc)
+    else:
+        response_data["workflow_triggered"] = False
+        response_data["note"] = "No workflow configured for this vendor endpoint"
+
+    return response_data
 
 async def trigger_workflow_async(
     workflow_id: str,
@@ -484,3 +695,19 @@ async def get_recent_messages(
             "total": len(messages)
         }
     }
+@router.post("/{vendor_slug}/hl7/ingest")
+async def ingest_hl7_message_compat(
+    vendor_slug: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    raw_message: str,
+    vendor_info: Dict[str, Any] = Depends(validate_api_key)
+):
+    return await ingest_vendor_message(
+        vendor_slug=vendor_slug,
+        format_slug="hl7",
+        request=request,
+        background_tasks=background_tasks,
+        raw_message=raw_message,
+        vendor_info=vendor_info
+    )

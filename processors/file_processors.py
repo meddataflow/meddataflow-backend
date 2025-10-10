@@ -21,6 +21,13 @@ import asyncssh
 from models.workflow_models import WorkflowContext, ActivityResult, ActivityStatus
 from services.hl7_parser import ParsedHL7Message
 from services.s3_service import s3_service
+from services.secrets import resolve_secret
+try:
+    from google.cloud import bigquery as _bq
+    _BIGQUERY_IMPORT_ERROR = None
+except ImportError as exc:  # Defer failure so server can still boot without BigQuery support
+    _bq = None
+    _BIGQUERY_IMPORT_ERROR = exc
 from database.connection import fetch_one_dict, fetch_all_dict, execute_dict
 
 logger = logging.getLogger(__name__)
@@ -547,14 +554,139 @@ async def process_format_converter_activity(activity: Dict[str, Any], context: W
 
 
 async def process_data_mapper_activity(activity: Dict[str, Any], context: WorkflowContext) -> ActivityResult:
-    """Process data mapper activity (mock)"""
+    """Process data mapper activity (enhanced)"""
     config = activity.get("config", {})
-    mappings = config.get("mappings", [])
+    mappings = config.get("mappings", []) or []
+
+    result_obj: Dict[str, Any] = {}
+
+    def tmpl_expr(expr: str) -> str:
+        # Very simple template replacement: {var} -> context.variables[var]
+        out = expr
+        for k, v in context.variables.items():
+            out = out.replace(f"{{{k}}}", str(v))
+            out = out.replace(f"{{{{{k}}}}}", str(v))
+        # HL7 extractor: {{HL7:PID.5.1}}
+        import re as _re
+        for m in _re.findall(r"\{\{HL7:([^}]+)\}\}", out):
+            out = out.replace(f"{{{{HL7:{m}}}}}", _extract_hl7_value(context.message, m) if context.message else "")
+        return out
+
+    for mapping in mappings:
+        source_path = mapping.get('source_path') or mapping.get('source')
+        target_path = mapping.get('target_path') or mapping.get('target')
+        default_value = mapping.get('default_value')
+        expr = mapping.get('expr')
+
+        if not target_path:
+            continue
+        value = None
+        if expr and isinstance(expr, str):
+            value = tmpl_expr(expr)
+        elif source_path:
+            # Prefer HL7 if message present
+            if context.message:
+                value = _extract_hl7_value(context.message, source_path)
+            if (not value) and source_path in context.variables:
+                value = context.variables.get(source_path)
+        if (value is None or value == '') and default_value is not None:
+            value = default_value
+        # Assign to flat key
+        result_obj[target_path] = value
+
+    # Merge into variables under mapped_*
+    variables_update = { **{ f"mapped_{k}": v for k, v in result_obj.items() }, **result_obj }
 
     return ActivityResult(
         status=ActivityStatus.COMPLETED,
-        output_data={"message": "Data mapping completed", "mappings_applied": len(mappings)}
+        output_data={"message": "Data mapping completed", "mapped": result_obj},
+        variables=variables_update
     )
+
+
+async def process_sftp_fetch_activity(activity: Dict[str, Any], context: WorkflowContext) -> ActivityResult:
+    """Fetch files from FTP/SFTP and load into variables.
+
+    Config:
+      connection: { protocol: 'sftp'|'ftp', host, port?, username, password }
+      remote: { path: string, pattern?: string, max_files?: number, delete_after?: boolean, set_message?: boolean }
+      encoding?: 'utf-8'
+    """
+    cfg = activity.get('config', {}) or {}
+    conn = cfg.get('connection', {}) or {}
+    remote = cfg.get('remote', {}) or {}
+    protocol = (conn.get('protocol') or 'sftp').lower()
+    host = conn.get('host')
+    port = int(conn.get('port') or (22 if protocol == 'sftp' else 21))
+    username = conn.get('username')
+    password = await resolve_secret(conn.get('password'))
+    path = remote.get('path') or '/'
+    pattern = remote.get('pattern') or ''
+    max_files = int(remote.get('max_files') or 1)
+    delete_after = bool(remote.get('delete_after'))
+    set_message = bool(remote.get('set_message'))
+    encoding = cfg.get('encoding') or 'utf-8'
+
+    fetched: list = []
+    if protocol == 'sftp':
+        # SFTP using asyncssh
+        try:
+            async with asyncssh.connect(host, port=port, username=username, password=password) as conn_sftp:
+                async with conn_sftp.start_sftp_client() as sftp:
+                    entries = await sftp.listdir(path)
+                    count = 0
+                    for e in entries:
+                        if e.startswith('.'):
+                            continue
+                        if pattern and pattern not in e:
+                            continue
+                        fullp = f"{path.rstrip('/')}/{e}"
+                        try:
+                            data = await sftp.read(fullp)
+                            content = data.decode(encoding, errors='ignore')
+                            fetched.append({ 'filename': e, 'content': content })
+                            count += 1
+                            if delete_after:
+                                await sftp.remove(fullp)
+                            if count >= max_files:
+                                break
+                        except Exception:
+                            continue
+        except Exception as e:
+            return ActivityResult(status=ActivityStatus.FAILED, error_message=f"SFTP fetch failed: {e}")
+    else:
+        # FTP using aioftp
+        try:
+            async with aioftp.Client.context(host, port=port, user=username or 'anonymous', password=password or '') as client:
+                await client.change_directory(path)
+                infos = await client.list()
+                count = 0
+                async for info in infos:
+                    name = info[0].name
+                    if name.startswith('.'):
+                        continue
+                    if pattern and pattern not in name:
+                        continue
+                    try:
+                        stream = io.BytesIO()
+                        await client.download(name, stream)
+                        content = stream.getvalue().decode(encoding, errors='ignore')
+                        fetched.append({ 'filename': name, 'content': content })
+                        count += 1
+                        if delete_after:
+                            await client.remove_file(name)
+                        if count >= max_files:
+                            break
+                    except Exception:
+                        continue
+        except Exception as e:
+            return ActivityResult(status=ActivityStatus.FAILED, error_message=f"FTP fetch failed: {e}")
+
+    variables = { 'fetched_files': fetched }
+    if set_message and fetched:
+        variables['message'] = fetched[0].get('content')
+
+    return ActivityResult(status=ActivityStatus.COMPLETED, output_data={ 'fetched_count': len(fetched) }, variables=variables)
 
 
 async def process_json_converter_activity(activity: Dict[str, Any], context: WorkflowContext) -> ActivityResult:
@@ -579,3 +711,68 @@ async def process_pipe_converter_activity(activity: Dict[str, Any], context: Wor
         status=ActivityStatus.COMPLETED,
         output_data={"message": "Pipe-separated conversion completed", "pipe_content": ""}
     )
+
+
+async def process_bigquery_load_activity(activity: Dict[str, Any], context: WorkflowContext) -> ActivityResult:
+    """Load staged files from GCS into BigQuery table.
+
+    Config:
+      project?: string
+      dataset: string
+      table: string
+      gcs_uri: string or list of strings (gs://bucket/path/*.csv)
+      write_disposition?: WRITE_APPEND|WRITE_TRUNCATE|WRITE_EMPTY
+      autodetect?: boolean
+      source_format?: CSV|NEWLINE_DELIMITED_JSON
+      location?: string
+      creds_json?: secret uri to service account JSON (optional)
+    """
+    cfg = activity.get('config', {}) or {}
+    project = cfg.get('project')
+    dataset = cfg.get('dataset')
+    table = cfg.get('table')
+    gcs_uri = cfg.get('gcs_uri')
+    write_disp = cfg.get('write_disposition') or 'WRITE_APPEND'
+    autodetect = bool(cfg.get('autodetect', True))
+    source_format = (cfg.get('source_format') or 'CSV').upper()
+    location = cfg.get('location')
+    creds_json = await resolve_secret(cfg.get('creds_json'))
+
+    if not (dataset and table and gcs_uri):
+        return ActivityResult(status=ActivityStatus.FAILED, error_message='dataset, table, and gcs_uri are required')
+
+    if _bq is None:
+        return ActivityResult(
+            status=ActivityStatus.FAILED,
+            error_message=f"BigQuery support unavailable: {_BIGQUERY_IMPORT_ERROR}. "
+                          "Install the google-cloud-bigquery package in the backend environment."
+        )
+
+    try:
+        client_kwargs = {}
+        if project:
+            client_kwargs['project'] = project
+        if creds_json:
+            import json as _json
+            from google.oauth2 import service_account
+            info = _json.loads(creds_json)
+            creds = service_account.Credentials.from_service_account_info(info)
+            client_kwargs['credentials'] = creds
+        client = _bq.Client(**client_kwargs)
+
+        job_config = _bq.LoadJobConfig()
+        job_config.autodetect = autodetect
+        job_config.write_disposition = getattr(_bq.WriteDisposition, write_disp, _bq.WriteDisposition.WRITE_APPEND)
+        job_config.source_format = getattr(_bq.SourceFormat, source_format, _bq.SourceFormat.CSV)
+
+        uris = gcs_uri if isinstance(gcs_uri, list) else [gcs_uri]
+        table_id = f"{dataset}.{table}" if not project else f"{project}.{dataset}.{table}"
+        load_job = client.load_table_from_uri(uris, table_id, job_config=job_config, location=location)
+        result = load_job.result()
+        out = {
+            'state': load_job.state,
+            'output_rows': getattr(result, 'output_rows', None)
+        }
+        return ActivityResult(status=ActivityStatus.COMPLETED, output_data=out, variables={ 'bigquery_loaded': True, 'bq_output_rows': out.get('output_rows') })
+    except Exception as e:
+        return ActivityResult(status=ActivityStatus.FAILED, error_message=f"BigQuery load failed: {e}")

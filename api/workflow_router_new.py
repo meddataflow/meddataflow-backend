@@ -20,6 +20,39 @@ def validate_uuid(uuid_string: str) -> uuid.UUID:
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid UUID format")
 
+
+def _normalize_trigger_payload(trigger_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Normalize trigger/test data to support generic payloads and message formats."""
+    data = dict(trigger_data or {})
+
+    payload = data.pop("payload", None)
+    if payload is not None:
+        data.setdefault("raw_message", payload)
+        data.setdefault("message", payload)
+
+    message_format = data.get("message_format") or data.get("format")
+    if message_format:
+        data["message_format"] = message_format
+        data.setdefault("format", message_format)
+
+        format_aliases = {
+            "hl7": ["hl7_payload"],
+            "fhir": ["fhir_payload"],
+            "dicom": ["dicom_payload", "dicom_file"],
+            "ncpdp": ["ncpdp_payload"],
+            "x12": ["x12_payload"],
+            "cda": ["cda_payload"],
+            "ccd": ["ccd_payload"],
+            "ccr": ["ccr_payload"],
+            "terminology": ["terminology_payload"],
+        }
+        aliases = format_aliases.get(str(message_format).lower())
+        if aliases and payload is not None:
+            for alias in aliases:
+                data.setdefault(alias, payload)
+
+    return data
+
 @router.post("/", response_model=Workflow)
 async def create_workflow(workflow_data: WorkflowCreate, current_user: Dict[str, Any] = Depends(get_current_user)):
     import uuid
@@ -330,10 +363,11 @@ async def execute_workflow(workflow_id: str, trigger_data: Optional[dict] = None
     # Prepare trigger data
     if not trigger_data:
         trigger_data = {}
-    
-    # Add default trigger data if it's an HL7 message
-    if "message" in trigger_data or "raw_message" in trigger_data:
-        trigger_data["source"] = "api"
+
+    trigger_data = _normalize_trigger_payload(trigger_data)
+
+    if trigger_data.get("message") or trigger_data.get("raw_message"):
+        trigger_data.setdefault("source", "api")
         trigger_data["message"] = trigger_data.get("message") or trigger_data.get("raw_message")
     
     try:
@@ -755,7 +789,8 @@ async def test_workflow(
     if not workflow_data:
         raise HTTPException(status_code=404, detail="Workflow not found")
     
-    # Add test flag to trigger data
+    # Normalize payload and add test metadata
+    test_data = _normalize_trigger_payload(test_data)
     test_data["source"] = "test"
     test_data["is_test"] = True
     
@@ -831,3 +866,27 @@ async def get_execution_activities(
         "workflow_name": workflow_execution["workflow_name"],
         "activity_executions": activity_executions
     }
+class MappingPreviewRequest(BaseModel):
+    raw_message: str
+    mappings: List[Dict[str, Any]]
+
+@router.post("/mapping/preview")
+async def mapping_preview(req: MappingPreviewRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Preview data mapper output for a sample HL7 message and mappings config."""
+    from models.workflow_models import WorkflowContext, ActivityResult, ActivityStatus
+    from processors.file_processors import process_data_mapper_activity
+    # Build a minimal context
+    ctx = WorkflowContext(
+        workflow_id=str(uuid.uuid4()),
+        execution_id=str(uuid.uuid4()),
+        tenant_id=str(current_user.get('tenant_id')),
+        variables={ 'source': 'preview' },
+        raw_message=req.raw_message,
+        execution_log=[]
+    )
+    activity = { 'name': 'mapping-preview', 'config': { 'mappings': req.mappings } }
+    try:
+        res: ActivityResult = await process_data_mapper_activity(activity, ctx)
+        return { 'mapped': res.output_data.get('mapped'), 'variables': res.variables }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Preview failed: {e}")

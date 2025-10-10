@@ -4,10 +4,14 @@ python-dotenv>=1.0.1
 pydantic>=2.6.4
 email-validator>=2.2.0
 pyjwt>=2.10.1
+# Pin bcrypt to a version compatible with passlib to avoid init errors
 passlib[bcrypt]>=1.7.4
+bcrypt==4.0.1
 python-multipart>=0.0.9
 hl7==0.4.5
 stripe>=10.0.0
+pydicom>=2.4.0
+fhir.resources>=7.1.0
 
 # Database dependencies
 sqlalchemy>=2.0.29
@@ -35,9 +39,15 @@ databricks-sql-connector>=3.0.0
 pyotp>=2.9.0
 qrcode[pil]>=7.4.2
 google-cloud-storage>=3.4.0
+google-cloud-bigquery>=3.22.0
 
 # Input validation and security
 marshmallow>=3.20.0
 slowapi>=0.1.9
+
+# Optional (not required at runtime, used if configured)
+# aiokafka>=0.8.6
+# opentelemetry-instrumentation-fastapi>=0.45b0
+# opentelemetry-sdk>=1.25.0
 
 colorama>=0.4.6

@@ -8,6 +8,7 @@ from datetime import datetime
 import uuid
 
 from models.hl7_message import HL7MessageRepository, MessageStatus, MessageDirection
+import os
 from api.auth_deps import get_current_user, get_current_tenant
 from services.hl7_parser import HL7Parser
 
@@ -22,7 +23,7 @@ class HL7MessageResponse(BaseModel):
     hl7_version: Optional[str] = None
     status: str
     direction: str
-    raw_message: str
+    raw_message: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -74,6 +75,9 @@ async def get_messages(
             status=message_status if message_status else None
         )
         
+        # PHI masking: only admins see raw_message
+        user_role = (current_user.get('role') or '').upper()
+        can_view_phi = user_role in ('SUPER_ADMIN', 'TENANT_ADMIN', 'WORKFLOW_ADMIN')
         return [
             HL7MessageResponse(
                 id=str(msg['id']),
@@ -83,7 +87,7 @@ async def get_messages(
                 hl7_version=msg['hl7_version'],
                 status=msg['status'],
                 direction=msg['direction'],
-                raw_message=msg['raw_message'],
+                raw_message=msg['raw_message'] if can_view_phi else '[REDACTED] — insufficient privileges',
                 created_at=msg['created_at'],
                 updated_at=msg['updated_at']
             )
@@ -116,6 +120,9 @@ async def get_message(
                 detail="Message not found"
             )
             
+        # PHI masking
+        user_role = (current_user.get('role') or '').upper()
+        can_view_phi = user_role in ('SUPER_ADMIN', 'TENANT_ADMIN', 'WORKFLOW_ADMIN')
         return HL7MessageResponse(
             id=str(message['id']),
             message_control_id=message.get('message_control_id'),
@@ -124,7 +131,7 @@ async def get_message(
             hl7_version=message['hl7_version'],
             status=message['status'],
             direction=message['direction'],
-            raw_message=message['raw_message'],
+            raw_message=message['raw_message'] if can_view_phi else '[REDACTED] — insufficient privileges',
             created_at=message['created_at'],
             updated_at=message['updated_at']
         )
@@ -154,7 +161,17 @@ async def create_message(
             tenant_id = uuid.UUID(tenant_id)
         if isinstance(user_id, str):
             user_id = uuid.UUID(user_id)
-            
+        
+        # Tenant-specific ingestion settings (dedup/quarantine)
+        tenant_settings = current_tenant.get('settings') or {}
+        if isinstance(tenant_settings, str):
+            try:
+                import json as _json
+                tenant_settings = _json.loads(tenant_settings)
+            except Exception:
+                tenant_settings = {}
+        ingestion_cfg = (tenant_settings or {}).get('ingestion', {}) or {}
+
         # Parse the HL7 message using enhanced parser
         try:
             parser = HL7Parser()
@@ -175,7 +192,7 @@ async def create_message(
                 "field_count": sum(len(seg.fields) for seg in parsed_message.segments)
             }
             english_translation = parsed_message.english_translation
-            
+        
         except Exception as parse_error:
             # If parsing fails, store basic info
             message_type = "Unknown"
@@ -186,7 +203,86 @@ async def create_message(
             receiving_application = None
             parsed_data = {"parse_error": str(parse_error)}
             english_translation = [f"Failed to parse message: {str(parse_error)}"]
-        
+            # Optionally add to quarantine (tenant setting overrides env) but continue with standard creation
+            import os as _os, json as _json
+            try:
+                q_flag = ingestion_cfg.get('quarantine_on_parse_error')
+                if (q_flag is True) or (_os.getenv("QUARANTINE_ON_PARSE_ERROR", "false").lower() == "true" and q_flag is not False):
+                    from models.quarantine import QuarantineRepository
+                    await QuarantineRepository.add_item(
+                        tenant_id=tenant_id,
+                        raw_message=message_data.raw_message,
+                        reason_code="PARSE_ERROR",
+                        reason_detail={"error": str(parse_error)},
+                        created_by_id=user_id,
+                    )
+            except Exception:
+                pass
+        # Duplicate detection by message_control_id (MSH-10)
+        try:
+            dedup_window = int(ingestion_cfg.get('dedup_window_minutes')) if ingestion_cfg.get('dedup_window_minutes') is not None else int(os.getenv("DEDUP_WINDOW_MINUTES", "1440"))
+        except Exception:
+            dedup_window = 1440
+        dedup_action = (ingestion_cfg.get('dedup_action') or os.getenv("DEDUP_ACTION", "IGNORE")).upper()  # IGNORE | ERROR | STORE_IGNORED
+
+        existing: Optional[Dict[str, Any]] = None
+        if message_control_id:
+            existing = await HL7MessageRepository.find_recent_by_control_id(
+                tenant_id=tenant_id,
+                message_control_id=message_control_id,
+                window_minutes=dedup_window
+            )
+        if existing:
+            if dedup_action == "ERROR":
+                raise HTTPException(status_code=409, detail="Duplicate message (by control ID)")
+            elif dedup_action == "STORE_IGNORED":
+                # Create a new ignored record referencing original
+                import json as _json
+                message = await HL7MessageRepository.create_message(
+                    tenant_id=tenant_id,
+                    raw_message=message_data.raw_message,
+                    message_type=message_type,
+                    event_type=event_type,
+                    hl7_version=hl7_version,
+                    message_control_id=message_control_id,
+                    sending_application=sending_application,
+                    receiving_application=receiving_application,
+                    parsed_message=_json.dumps(parsed_data),
+                    english_translation=_json.dumps(english_translation),
+                    created_by_id=user_id,
+                    source_endpoint=message_data.source_endpoint,
+                    status=MessageStatus.IGNORED.value,
+                    direction=MessageDirection.INBOUND.value,
+                    processing_errors=_json.dumps({"duplicate_of": str(existing['id'])})
+                )
+
+                return HL7MessageResponse(
+                    id=str(message['id']),
+                    message_control_id=message.get('message_control_id'),
+                    message_type=message['message_type'],
+                    event_type=message.get('event_type'),
+                    hl7_version=message['hl7_version'],
+                    status=message['status'],
+                    direction=message['direction'],
+                    raw_message=message['raw_message'],
+                    created_at=message['created_at'],
+                    updated_at=message['updated_at']
+                )
+            else:
+                # IGNORE: return the existing record
+                return HL7MessageResponse(
+                    id=str(existing['id']),
+                    message_control_id=existing.get('message_control_id'),
+                    message_type=existing['message_type'],
+                    event_type=existing.get('event_type'),
+                    hl7_version=existing['hl7_version'],
+                    status=existing['status'],
+                    direction=existing['direction'],
+                    raw_message=existing['raw_message'],
+                    created_at=existing['created_at'],
+                    updated_at=existing['updated_at']
+                )
+
         message = await HL7MessageRepository.create_message(
             tenant_id=tenant_id,
             raw_message=message_data.raw_message,
