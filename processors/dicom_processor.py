@@ -111,7 +111,8 @@ def _build_result(
 def _decode_dicom_payload(payload: Any) -> Tuple[Optional[bytes], Dict[str, Any]]:
     """Decode DICOM payload from various formats"""
     if isinstance(payload, (bytes, bytearray)):
-        return bytes(payload), {}
+        binary = bytes(payload)
+        return binary, _extract_dicom_metadata(binary)
     if isinstance(payload, str):
         try:
             binary = base64.b64decode(payload, validate=True)
@@ -134,7 +135,8 @@ def _extract_dicom_metadata(binary_payload: bytes) -> Dict[str, Any]:
             logger.warning("pydicom not installed, cannot parse DICOM metadata")
             return {"error": "pydicom not installed", "install_command": "pip install pydicom"}
 
-        dataset = pydicom.dcmread(io.BytesIO(binary_payload), stop_before_pixels=True, force=True)
+        # Read WITHOUT stop_before_pixels to get frame information
+        dataset = pydicom.dcmread(io.BytesIO(binary_payload), force=True)
 
         def _safe_attr(attr: str) -> Optional[str]:
             value = getattr(dataset, attr, None)
@@ -221,6 +223,70 @@ def _extract_dicom_metadata(binary_payload: bytes) -> Dict[str, Any]:
             "NumberOfFrames": _safe_attr("NumberOfFrames"),
         }
         metadata.update({k: v for k, v in image_chars.items() if v})
+
+        # Multi-frame specific information
+        try:
+            # Check if NumberOfFrames exists in DICOM tags
+            has_num_frames_tag = hasattr(dataset, 'NumberOfFrames')
+            num_frames = int(getattr(dataset, 'NumberOfFrames', 1))
+
+            logger.info(f"[DICOM] NumberOfFrames tag present: {has_num_frames_tag}, value: {num_frames}")
+
+            # Pixel data information (needed for frame extraction)
+            actual_frames = 1
+            if hasattr(dataset, 'pixel_array'):
+                pixel_shape = dataset.pixel_array.shape
+                metadata["PixelDataShape"] = str(pixel_shape)
+
+                logger.info(f"[DICOM] Pixel array shape: {pixel_shape}")
+
+                # Determine actual number of frames from pixel data shape
+                if len(pixel_shape) == 3:
+                    # Multi-dimensional array - could be multi-frame
+                    # Common formats: (frames, rows, cols) or (rows, cols, channels)
+                    # For medical imaging, if first dimension matches NumberOfFrames or is larger, it's frames
+                    if pixel_shape[0] > 1 and (not has_num_frames_tag or pixel_shape[0] == num_frames):
+                        actual_frames = pixel_shape[0]
+                        metadata["FrameDimensions"] = f"{pixel_shape[1]}x{pixel_shape[2]}"
+                        logger.info(f"[DICOM] Detected {actual_frames} frames from pixel data shape")
+                    elif pixel_shape[2] > 3:  # More than RGB channels - likely frames on last axis
+                        actual_frames = pixel_shape[2]
+                        metadata["FrameDimensions"] = f"{pixel_shape[0]}x{pixel_shape[1]}"
+                        logger.info(f"[DICOM] Detected {actual_frames} frames on last axis")
+                    else:
+                        metadata["FrameDimensions"] = f"{pixel_shape[0]}x{pixel_shape[1]}"
+                elif len(pixel_shape) == 2:
+                    metadata["FrameDimensions"] = f"{pixel_shape[0]}x{pixel_shape[1]}"
+                elif len(pixel_shape) == 4:
+                    # (time/frames, slices, rows, cols) - use first dimension as frames
+                    actual_frames = pixel_shape[0]
+                    metadata["FrameDimensions"] = f"{pixel_shape[2]}x{pixel_shape[3]}"
+                    logger.info(f"[DICOM] Detected {actual_frames} frames from 4D pixel data")
+
+            # Use the higher of NumberOfFrames tag or detected frames
+            final_num_frames = max(num_frames, actual_frames)
+            metadata["NumberOfFrames"] = final_num_frames
+            metadata["is_multiframe"] = final_num_frames > 1
+
+            logger.info(f"[DICOM] Final frame count: {final_num_frames}, is_multiframe: {final_num_frames > 1}")
+
+            # Frame timing information for cine/dynamic studies
+            if hasattr(dataset, 'FrameTime'):
+                frame_time = float(dataset.FrameTime)  # milliseconds per frame
+                metadata["FrameTime"] = frame_time
+                metadata["RecommendedFPS"] = round(1000.0 / frame_time, 2) if frame_time > 0 else 30
+            elif hasattr(dataset, 'FrameDelay'):
+                frame_delay = float(dataset.FrameDelay)  # milliseconds
+                metadata["FrameDelay"] = frame_delay
+                metadata["RecommendedFPS"] = round(1000.0 / frame_delay, 2) if frame_delay > 0 else 30
+            elif hasattr(dataset, 'CineRate'):
+                metadata["RecommendedFPS"] = float(dataset.CineRate)
+            else:
+                # Default FPS for multi-frame studies
+                metadata["RecommendedFPS"] = 30 if final_num_frames > 1 else None
+
+        except Exception as frame_exc:
+            logger.warning(f"Could not extract multi-frame info: {frame_exc}", exc_info=True)
 
         # Additional attributes
         additional_info = {

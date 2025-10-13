@@ -467,6 +467,7 @@ def _parse_telecommunication_segments(payload: str) -> Dict[str, Any]:
             line_mode = True
 
     if line_mode:
+        logger.debug(f"NCPDP: Entering line mode, found {len(line_segments)} line segments")
         for segment in line_segments:
             parts = [part.strip() for part in segment.split("|") if part.strip()]
             if not parts:
@@ -476,14 +477,19 @@ def _parse_telecommunication_segments(payload: str) -> Dict[str, Any]:
             segment_id = _normalize_segment_name(raw_segment_name)
             fields: Dict[str, Any] = {"_segment_label": raw_segment_name}
 
+            logger.debug(f"NCPDP: Processing segment '{raw_segment_name}' -> '{segment_id}' with {len(parts)-1} field parts")
+
             for field_part in parts[1:]:
                 delimiter = ":" if ":" in field_part else "=" if "=" in field_part else None
                 if not delimiter:
+                    logger.debug(f"NCPDP: Skipping field part without delimiter: '{field_part}'")
                     continue
                 key, value = field_part.split(delimiter, 1)
+                logger.debug(f"NCPDP: Storing field {key.strip()} = {value.strip()}")
                 store_field(key, value, fields)
 
             if len(fields) <= 1:  # Only segment label present
+                logger.debug(f"NCPDP: Skipping segment '{segment_id}' - no fields extracted")
                 continue
 
             existing = result["segments"].get(segment_id)
@@ -495,12 +501,14 @@ def _parse_telecommunication_segments(payload: str) -> Dict[str, Any]:
             else:
                 result["segments"][segment_id] = fields
 
+        logger.debug(f"NCPDP: Parsed {len(result['segments'])} segments, {len(unique_field_codes)} unique fields, {len(result['raw_fields'])} raw fields")
         enrich_structured_fields()
 
         result["segment_count"] = sum(
             len(v) if isinstance(v, list) else 1 for v in result["segments"].values()
         )
         result["field_count"] = len(unique_field_codes)
+        logger.debug(f"NCPDP: Final field_count={result['field_count']}, segment_count={result['segment_count']}")
         return result
 
     # Fallback to control-character separated format
@@ -971,6 +979,125 @@ def _format_ncpdp_date(date_str: str) -> str:
         return date_str
 
 
+def _extract_nested_value(data: Dict[str, Any], path: str) -> Any:
+    """
+    Extract value from nested dictionary using dot notation path
+    Example: "claim.prescription_number" -> data["claim"]["prescription_number"]
+    """
+    if not data or not path:
+        return None
+
+    current = data
+    for part in path.split("."):
+        if isinstance(current, dict):
+            current = current.get(part)
+        else:
+            return None
+        if current is None:
+            return None
+
+    return current
+
+
+def _extract_ncpdp_variables(parsed: Dict[str, Any], format_type: str) -> Dict[str, Any]:
+    """
+    Extract commonly used variables from parsed NCPDP message for easy access in workflows
+    """
+    variables: Dict[str, Any] = {}
+
+    if format_type == "telecommunication" or parsed.get("format") == "telecommunication_d0":
+        # Extract from telecommunication format
+        claim = parsed.get("claim", {})
+        patient = parsed.get("patient", {})
+        prescriber = parsed.get("prescriber", {})
+        insurance = parsed.get("insurance", {})
+        pricing = parsed.get("pricing", {})
+        header = parsed.get("header", {})
+
+        # Common claim fields
+        variables["rx_number"] = claim.get("prescription_number") or ""
+        variables["quantity"] = claim.get("quantity_dispensed") or ""
+        variables["product_id"] = claim.get("product_id") or ""
+        variables["ndc"] = claim.get("product_id") if claim.get("product_id_qualifier") == "03" else ""
+        variables["days_supply"] = claim.get("days_supply") or ""
+        variables["date_of_service"] = claim.get("date_of_service") or ""
+        variables["refills_authorized"] = claim.get("refills_authorized") or ""
+        variables["fill_number"] = claim.get("fill_number") or ""
+
+        # Patient fields
+        variables["patient_first_name"] = patient.get("first_name") or ""
+        variables["patient_last_name"] = patient.get("last_name") or ""
+        variables["patient_name"] = patient.get("full_name") or ""
+        variables["patient_dob"] = patient.get("date_of_birth") or ""
+        variables["patient_gender"] = patient.get("gender") or ""
+        variables["patient_id"] = insurance.get("cardholder_id") or ""
+        variables["patient_phone"] = patient.get("phone") or ""
+        variables["patient_address"] = patient.get("address") or ""
+
+        # Prescriber fields
+        variables["prescriber_id"] = prescriber.get("identifier") or ""
+        variables["prescriber_name"] = prescriber.get("last_name") or ""
+
+        # Insurance fields
+        variables["cardholder_id"] = insurance.get("cardholder_id") or ""
+        variables["group_id"] = insurance.get("group_id") or ""
+        variables["payer_id"] = insurance.get("payer_id") or ""
+
+        # Pricing fields
+        variables["ingredient_cost"] = pricing.get("ingredient_cost") or ""
+        variables["dispensing_fee"] = pricing.get("dispensing_fee") or ""
+        variables["total_amount_paid"] = pricing.get("total_amount_paid") or ""
+        variables["patient_pay_amount"] = pricing.get("patient_pay_amount") or ""
+
+        # Header fields
+        variables["bin_number"] = header.get("bin_number") or ""
+        variables["transaction_code"] = header.get("transaction_code") or ""
+        variables["transaction_type"] = parsed.get("transaction_type") or ""
+
+        # Legacy compatibility - "drug_name" doesn't exist in NCPDP, use product_id
+        variables["drug_name"] = variables["product_id"]
+
+    elif format_type == "script_xml" or parsed.get("format") == "script_xml":
+        # Extract from SCRIPT XML format
+        patient = parsed.get("patient", {})
+        medication = parsed.get("medication", {})
+        prescriber = parsed.get("prescriber", {})
+        pharmacy = parsed.get("pharmacy", {})
+
+        # Medication fields
+        variables["drug_name"] = medication.get("drug_description") or ""
+        variables["product_id"] = medication.get("product_code") or ""
+        variables["ndc"] = medication.get("product_code") or ""
+        variables["quantity"] = medication.get("quantity") or ""
+        variables["days_supply"] = medication.get("days_supply") or ""
+        variables["refills"] = medication.get("refills") or ""
+        variables["rx_number"] = medication.get("prescription_number") or ""
+        variables["written_date"] = medication.get("written_date") or ""
+        variables["directions"] = parsed.get("directions") or ""
+
+        # Patient fields
+        variables["patient_name"] = patient.get("name") or ""
+        variables["patient_first_name"] = patient.get("first_name") or ""
+        variables["patient_last_name"] = patient.get("last_name") or ""
+        variables["patient_dob"] = patient.get("date_of_birth") or ""
+        variables["patient_gender"] = patient.get("gender") or ""
+        variables["patient_id"] = patient.get("name") or ""  # SCRIPT doesn't have patient ID typically
+        variables["patient_phone"] = patient.get("phone") or ""
+        variables["patient_address"] = patient.get("address") or ""
+
+        # Prescriber fields
+        variables["prescriber_name"] = prescriber.get("name") or ""
+        variables["prescriber_npi"] = prescriber.get("npi") or ""
+        variables["prescriber_dea"] = prescriber.get("dea") or ""
+
+        # Pharmacy fields
+        variables["pharmacy_name"] = pharmacy.get("business_name") or pharmacy.get("name") or ""
+        variables["pharmacy_ncpdp_id"] = pharmacy.get("ncpdp_id") or ""
+        variables["pharmacy_npi"] = pharmacy.get("npi") or ""
+
+    return variables
+
+
 # --------------------------------------------------------------------------- #
 # NCPDP SCRIPT XML Parsing (NewRx, RxFill, etc.)
 # --------------------------------------------------------------------------- #
@@ -1410,9 +1537,21 @@ async def process_ncpdp_parser_activity(activity: Dict[str, Any], context: Workf
     Parse NCPDP message (auto-detects format: Telecommunication D.0 or SCRIPT XML)
     """
     config = activity.get("config", {})
+
+    logger.info("=" * 80)
+    logger.info("NCPDP PARSER START")
+    logger.info(f"Config: {config}")
+    logger.info(f"Context variables keys: {list(context.variables.keys())}")
+    logger.info(f"Context raw_message type: {type(context.raw_message)}")
+    logger.info(f"Context raw_message preview: {str(context.raw_message)[:200]}")
+
     payload = _resolve_payload_from_context(context, config, ["ncpdp_payload", "ncpdp_message"])
 
+    logger.info(f"Resolved payload type: {type(payload)}")
+    logger.info(f"Resolved payload preview: {str(payload)[:500]}")
+
     if not payload:
+        logger.error("No NCPDP payload available")
         return _build_result(
             ActivityStatus.FAILED,
             "NCPDP parser failed",
@@ -1421,6 +1560,9 @@ async def process_ncpdp_parser_activity(activity: Dict[str, Any], context: Workf
         )
 
     payload_str = payload.decode() if isinstance(payload, (bytes, bytearray)) else str(payload)
+    logger.info(f"Payload string length: {len(payload_str)}")
+    logger.info(f"Payload string preview: {payload_str[:500]}")
+    logger.info("=" * 80)
 
     # Detect format
     format_type = _detect_ncpdp_format(payload_str)
@@ -1446,15 +1588,73 @@ async def process_ncpdp_parser_activity(activity: Dict[str, Any], context: Workf
             error=parsed.get("error")
         )
 
+    # Check if user provided explicit variable extraction configuration
+    variables_config = config.get("variables", [])
+    extraction_rules = _safe_json_loads(config.get("extraction_rules")) or config.get("extraction_rules")
+
+    # If user provided explicit configuration, only extract those variables
+    # Otherwise, use automatic extraction for convenience
+    if variables_config or extraction_rules:
+        extracted_variables: Dict[str, Any] = {}
+
+        # Process variables config (old style, from UI)
+        if isinstance(variables_config, list):
+            for var_def in variables_config:
+                var_name = var_def.get("name")
+                var_source = var_def.get("source")
+                var_default = var_def.get("default", "")
+
+                if var_name and var_source:
+                    # Map common field names to actual parsed data paths
+                    value = None
+                    source_upper = var_source.upper()
+
+                    # Try to find the value in parsed data
+                    if source_upper in ["RX_NUMBER", "PRESCRIPTION_NUMBER"]:
+                        value = parsed.get("claim", {}).get("prescription_number", var_default)
+                    elif source_upper == "PATIENT_ID":
+                        value = parsed.get("insurance", {}).get("cardholder_id", var_default)
+                    elif source_upper in ["DRUG_NAME", "PRODUCT_ID", "NDC"]:
+                        value = parsed.get("claim", {}).get("product_id", var_default)
+                    elif source_upper == "QUANTITY":
+                        value = parsed.get("claim", {}).get("quantity_dispensed", var_default)
+                    else:
+                        # Try direct field lookup in raw_fields
+                        value = parsed.get("raw_fields", {}).get(var_source, var_default)
+
+                    extracted_variables[var_name] = value if value is not None else var_default
+
+        # Process extraction rules (new style, dot notation paths)
+        if isinstance(extraction_rules, list):
+            for rule in extraction_rules:
+                name = rule.get("name")
+                path = rule.get("path")
+                if name and path:
+                    value = _extract_nested_value(parsed, path)
+                    if value is not None:
+                        extracted_variables[name] = value
+    else:
+        # No explicit configuration - use automatic extraction
+        extracted_variables = _extract_ncpdp_variables(parsed, format_type)
+
     store_as = config.get("store_parsed_as", "ncpdp_message")
     _set_context_variable(context, store_as, parsed)
     _set_context_variable(context, "ncpdp_format", format_type)
 
+    # Set all extracted variables in context
+    context.variables.update(extracted_variables)
+
     return _build_result(
         ActivityStatus.COMPLETED,
         f"NCPDP message parsed ({format_type})",
-        {"parsed_data": parsed, "format": format_type},
-        variables={store_as: parsed, "ncpdp_format": format_type}
+        {
+            "parsed_data": parsed,
+            "format": format_type,
+            "field_count": parsed.get("field_count", 0),
+            "parsed_fields": parsed.get("raw_fields", {}),
+            "extracted_variables": extracted_variables
+        },
+        variables={store_as: parsed, "ncpdp_format": format_type, **extracted_variables}
     )
 
 

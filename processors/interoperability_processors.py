@@ -180,30 +180,53 @@ async def process_fhir_parser_activity(activity: Dict[str, Any], context: Workfl
             error=str(exc)
         )
 
+    # Support both old-style extraction_rules and new-style variables config (like HL7 parser)
+    variable_definitions = config.get("variables", [])
     extraction_rules = _safe_json_loads(config.get("extraction_rules")) or config.get("extraction_rules")
+
     extracted_values: Dict[str, Any] = {}
+
+    # Process new-style variables (consistent with HL7 parser)
+    for var_def in variable_definitions:
+        var_name = var_def.get("name")
+        var_source = var_def.get("source")  # JSON path like "name[0].family"
+        var_default = var_def.get("default", "")
+
+        if var_name and var_source:
+            value = _extract_json_path(resource, var_source)
+            if value is None:
+                value = var_default
+            extracted_values[var_name] = value
+            context.variables[var_name] = value
+
+    # Process old-style extraction_rules for backward compatibility
     if isinstance(extraction_rules, list):
         for rule in extraction_rules:
             name = rule.get("name")
             path = rule.get("path")
+            default = rule.get("default", "")
             if name and path:
-                extracted_values[name] = _extract_json_path(resource, path)
+                value = _extract_json_path(resource, path)
+                if value is None:
+                    value = default
+                extracted_values[name] = value
+                context.variables[name] = value
 
     # Supply smart defaults if the caller did not define extraction rules
     auto_values = extract_common_fhir_values(resource)
     for key, value in auto_values.items():
         extracted_values.setdefault(key, value)
+        context.variables.setdefault(key, value)
 
     store_as = config.get("store_parsed_as", "fhir_resource")
     _set_context_variable(context, store_as, resource)
-    context.variables.update(extracted_values)
 
     return _build_result(
         ActivityStatus.COMPLETED,
         "FHIR message parsed",
         {
             "resource_type": resource.get("resourceType"),
-            "extracted_values": extracted_values,
+            "extracted_variables": extracted_values,
             "resource": resource,
         },
         variables={store_as: resource, "fhir_resource": resource, **extracted_values}
@@ -596,14 +619,34 @@ async def process_dicom_parser_activity(activity: Dict[str, Any], context: Workf
     if metadata:
         summary["metadata"] = metadata
 
+    # Extract variables from DICOM metadata (consistent with HL7 parser)
+    variable_definitions = config.get("variables", [])
+    extracted_values: Dict[str, Any] = {}
+
+    for var_def in variable_definitions:
+        var_name = var_def.get("name")
+        var_source = var_def.get("source")  # DICOM tag name like "PatientName", "PatientID"
+        var_default = var_def.get("default", "")
+
+        if var_name and var_source:
+            # Extract from metadata dict using the tag name as key
+            value = metadata.get(var_source) if isinstance(metadata, dict) else None
+            if value is None:
+                value = var_default
+            extracted_values[var_name] = value
+            context.variables[var_name] = value
+
     store_as = config.get("store_parsed_as", "dicom_metadata")
     _set_context_variable(context, store_as, metadata or summary)
 
     return _build_result(
         ActivityStatus.COMPLETED,
         "DICOM payload parsed",
-        summary,
-        variables={store_as: metadata or summary, "dicom_summary": summary}
+        {
+            **summary,
+            "extracted_variables": extracted_values,
+        },
+        variables={store_as: metadata or summary, "dicom_summary": summary, **extracted_values}
     )
 
 
@@ -942,14 +985,33 @@ async def process_ncpdp_parser_activity(activity: Dict[str, Any], context: Workf
     payload_str = payload.decode() if isinstance(payload, (bytes, bytearray)) else str(payload)
     parsed = _parse_delimited_pairs(payload_str, ("\r", "\n", "|", "\u001D", "\u001E"))
 
+    # Extract variables from NCPDP parsed fields (consistent with HL7 parser)
+    variable_definitions = config.get("variables", [])
+    extracted_values: Dict[str, Any] = {}
+
+    for var_def in variable_definitions:
+        var_name = var_def.get("name")
+        var_source = var_def.get("source")  # NCPDP field key
+        var_default = var_def.get("default", "")
+
+        if var_name and var_source:
+            # Extract from parsed dict using the field key
+            value = parsed.get(var_source, var_default)
+            extracted_values[var_name] = value
+            context.variables[var_name] = value
+
     store_as = config.get("store_parsed_as", "ncpdp_message")
     _set_context_variable(context, store_as, parsed)
 
     return _build_result(
         ActivityStatus.COMPLETED,
         "NCPDP payload parsed",
-        {"parsed_fields": parsed, "field_count": len(parsed)},
-        variables={store_as: parsed}
+        {
+            "parsed_fields": parsed,
+            "field_count": len(parsed),
+            "extracted_variables": extracted_values,
+        },
+        variables={store_as: parsed, **extracted_values}
     )
 
 
@@ -1070,6 +1132,65 @@ def _parse_x12_segments(payload: str) -> Dict[str, Any]:
     return parsed
 
 
+def _extract_x12_value(parsed_segments: Dict[str, Any], path: str, default: str = "") -> Any:
+    """
+    Extract value from parsed X12 segments using a path notation.
+    Path format: "SEGMENT_TAG[index].element_index"
+    Examples:
+        - "ST[0].0" -> First ST segment, element 0 (transaction type)
+        - "ISA[0].5" -> First ISA segment, element 5 (sender ID)
+        - "BEG[0].2" -> First BEG segment, element 2 (PO number)
+        - "N1[0].1" -> First N1 segment, element 1 (party name)
+    """
+    try:
+        # Parse the path
+        if "[" not in path:
+            # Simple tag reference - get first occurrence
+            segment_tag = path
+            segment_index = 0
+            element_index = None
+        elif "." in path:
+            # Full path with element index
+            segment_part, element_part = path.split(".", 1)
+            if "[" in segment_part:
+                segment_tag = segment_part.split("[")[0]
+                segment_index = int(segment_part.split("[")[1].rstrip("]"))
+            else:
+                segment_tag = segment_part
+                segment_index = 0
+            element_index = int(element_part)
+        else:
+            # Just segment with index, no element
+            segment_tag = path.split("[")[0]
+            segment_index = int(path.split("[")[1].rstrip("]"))
+            element_index = None
+
+        # Get the segment
+        if segment_tag not in parsed_segments:
+            return default
+
+        segments_list = parsed_segments[segment_tag]
+        if segment_index >= len(segments_list):
+            return default
+
+        segment_elements = segments_list[segment_index]
+
+        # If no element index specified, return the whole segment as joined string
+        if element_index is None:
+            return "*".join(segment_elements) if segment_elements else default
+
+        # Get specific element
+        if element_index >= len(segment_elements):
+            return default
+
+        value = segment_elements[element_index]
+        return value.strip() if value else default
+
+    except (ValueError, IndexError, KeyError) as e:
+        logger.debug(f"Error extracting X12 value from path '{path}': {e}")
+        return default
+
+
 async def process_x12_parser_activity(activity: Dict[str, Any], context: WorkflowContext) -> ActivityResult:
     config = activity.get("config", {})
     payload = _resolve_payload_from_context(context, config, ["x12_payload", "x12_message"])
@@ -1084,14 +1205,32 @@ async def process_x12_parser_activity(activity: Dict[str, Any], context: Workflo
     payload_str = payload.decode() if isinstance(payload, (bytes, bytearray)) else str(payload)
     parsed = _parse_x12_segments(payload_str)
 
+    # Extract variables from X12 segments (consistent with HL7 parser)
+    variable_definitions = config.get("variables", [])
+    extracted_values: Dict[str, Any] = {}
+
+    for var_def in variable_definitions:
+        var_name = var_def.get("name")
+        var_source = var_def.get("source")  # X12 path like "ST[0].0", "ISA[0].5"
+        var_default = var_def.get("default", "")
+
+        if var_name and var_source:
+            value = _extract_x12_value(parsed, var_source, var_default)
+            extracted_values[var_name] = value
+            context.variables[var_name] = value
+
     store_as = config.get("store_parsed_as", "x12_message")
     _set_context_variable(context, store_as, parsed)
 
     return _build_result(
         ActivityStatus.COMPLETED,
         "X12 payload parsed",
-        {"segment_count": len(parsed), "segments": parsed},
-        variables={store_as: parsed}
+        {
+            "segment_count": len(parsed),
+            "segments": parsed,
+            "extracted_variables": extracted_values,
+        },
+        variables={store_as: parsed, **extracted_values}
     )
 
 
@@ -1685,6 +1824,24 @@ async def _process_clinical_document_parser(
         )
 
     summary = _extract_clinical_document_summary(root)
+
+    # Extract variables from clinical document summary (consistent with HL7 parser)
+    variable_definitions = config.get("variables", [])
+    extracted_values: Dict[str, Any] = {}
+
+    for var_def in variable_definitions:
+        var_name = var_def.get("name")
+        var_source = var_def.get("source")  # Path like "patient.full_name", "patient.id"
+        var_default = var_def.get("default", "")
+
+        if var_name and var_source:
+            # Extract from summary using JSON path
+            value = _extract_json_path(summary, var_source)
+            if value is None:
+                value = var_default
+            extracted_values[var_name] = value
+            context.variables[var_name] = value
+
     store_as = config.get("store_parsed_as", f"{document_type}_document")
     parsed_document = {"document": payload_str, "summary": summary}
     _set_context_variable(context, store_as, parsed_document)
@@ -1693,8 +1850,11 @@ async def _process_clinical_document_parser(
     return _build_result(
         ActivityStatus.COMPLETED,
         f"{document_type.upper()} document parsed",
-        {"summary": summary},
-        variables={store_as: parsed_document, f"{document_type}_summary": summary}
+        {
+            "summary": summary,
+            "extracted_variables": extracted_values,
+        },
+        variables={store_as: parsed_document, f"{document_type}_summary": summary, **extracted_values}
     )
 
 

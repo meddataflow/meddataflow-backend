@@ -69,10 +69,6 @@ from processors.interoperability_processors import (
     process_dicom_transformer_activity,
     process_dicom_translator_activity,
     process_dicom_sender_activity,
-    process_ncpdp_parser_activity,
-    process_ncpdp_transformer_activity,
-    process_ncpdp_translator_activity,
-    process_ncpdp_sender_activity,
     process_x12_parser_activity,
     process_x12_transformer_activity,
     process_x12_translator_activity,
@@ -93,6 +89,13 @@ from processors.interoperability_processors import (
     process_terminology_mapper_activity,
     process_terminology_translator_activity,
     process_terminology_publisher_activity
+)
+# Import NCPDP processors from dedicated module for better parsing
+from processors.ncpdp_processor import (
+    process_ncpdp_parser_activity,
+    process_ncpdp_transformer_activity,
+    process_ncpdp_translator_activity,
+    process_ncpdp_sender_activity
 )
 
 logger = logging.getLogger(__name__)

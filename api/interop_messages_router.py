@@ -178,10 +178,11 @@ async def get_messages(
 @router.get("/{message_id}/dicom-file")
 async def get_dicom_file(
     message_id: str,
+    frame: Optional[int] = Query(None, description="Frame number for multi-frame DICOM (0-indexed)"),
     current_user: Dict[str, Any] = Depends(get_current_user),
     current_tenant: Dict[str, Any] = Depends(get_current_tenant)
 ):
-    """Get raw DICOM binary file for cornerstone viewer"""
+    """Get raw DICOM binary file for cornerstone viewer, optionally extracting a specific frame"""
     try:
         message_uuid = uuid.UUID(message_id)
 
@@ -221,12 +222,63 @@ async def get_dicom_file(
                 detail="DICOM file data not found"
             )
 
+        # If frame parameter is provided, extract single frame DICOM
+        if frame is not None:
+            try:
+                import pydicom
+                import io as io_module
+
+                # Read the original DICOM
+                dataset = pydicom.dcmread(io_module.BytesIO(bytes(binary_payload)), force=True)
+
+                # Check if it's multi-frame
+                num_frames = int(getattr(dataset, 'NumberOfFrames', 1))
+
+                if frame < 0 or frame >= num_frames:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Frame {frame} out of range (0-{num_frames-1})"
+                    )
+
+                # Extract the specific frame
+                if num_frames > 1 and hasattr(dataset, 'pixel_array'):
+                    pixel_array = dataset.pixel_array
+
+                    # Handle different array shapes
+                    if len(pixel_array.shape) == 3:
+                        # (frames, rows, cols)
+                        if pixel_array.shape[0] == num_frames:
+                            frame_data = pixel_array[frame, :, :]
+                        else:
+                            # (rows, cols, frames)
+                            frame_data = pixel_array[:, :, frame]
+                    else:
+                        frame_data = pixel_array
+
+                    # Create new dataset with single frame
+                    frame_dataset = pydicom.Dataset()
+                    frame_dataset.update(dataset)
+                    frame_dataset.PixelData = frame_data.tobytes()
+                    frame_dataset.NumberOfFrames = 1
+
+                    # Save to bytes
+                    frame_buffer = io_module.BytesIO()
+                    frame_dataset.save_as(frame_buffer, write_like_original=False)
+                    binary_payload = frame_buffer.getvalue()
+
+            except ImportError:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="pydicom not installed, cannot extract frames"
+                )
+
         # Return raw binary data with proper DICOM content type
         return Response(
             content=bytes(binary_payload),
             media_type="application/dicom",
             headers={
-                "Content-Disposition": f'inline; filename="{result.get("file_name", "image.dcm")}"'
+                "Content-Disposition": f'inline; filename="{result.get("file_name", "image.dcm")}"',
+                "Access-Control-Expose-Headers": "Content-Disposition"
             }
         )
     except ValueError:
@@ -238,6 +290,83 @@ async def get_dicom_file(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to fetch DICOM file: {str(e)}"
+        )
+
+@router.get("/{message_id}/dicom-metadata")
+async def get_dicom_metadata(
+    message_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_tenant: Dict[str, Any] = Depends(get_current_tenant)
+):
+    """Get DICOM metadata including multi-frame information"""
+    try:
+        message_uuid = uuid.UUID(message_id)
+
+        from database.connection import fetch_one
+        query = """
+        SELECT binary_payload, message_format, tenant_id, parsed_message
+        FROM hl7_messages
+        WHERE id = $1
+        """
+        result = await fetch_one(query, message_uuid)
+
+        if not result:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Message not found"
+            )
+
+        # Verify tenant ownership
+        if str(result['tenant_id']) != str(current_tenant['id']):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied"
+            )
+
+        # Verify it's a DICOM file
+        if result.get('message_format') != 'dicom':
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Message is not a DICOM file"
+            )
+
+        # ALWAYS re-parse to get the latest multi-frame detection
+        # (Don't use cached parsed_message as it may have old metadata)
+        binary_payload = result.get('binary_payload')
+
+        if not binary_payload:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="DICOM file data not found"
+            )
+
+        # Re-parse to get fresh metadata with multi-frame detection
+        from processors.dicom_processor import _decode_dicom_payload
+        import logging
+        logger = logging.getLogger(__name__)
+
+        logger.info(f"[API] Re-parsing DICOM to get fresh metadata...")
+        _, metadata = _decode_dicom_payload(binary_payload)
+
+        logger.info(f"[API] DICOM metadata: is_multiframe={metadata.get('is_multiframe')}, num_frames={metadata.get('NumberOfFrames')}")
+
+        return {
+            "success": True,
+            "metadata": metadata,
+            "is_multiframe": metadata.get('is_multiframe', False),
+            "num_frames": int(metadata.get('NumberOfFrames', 1)),
+            "recommended_fps": metadata.get('RecommendedFPS')
+        }
+
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid message ID format"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch DICOM metadata: {str(e)}"
         )
 
 @router.get("/{message_id}", response_model=MessageDetailResponse)
