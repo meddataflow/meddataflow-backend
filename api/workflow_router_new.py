@@ -890,3 +890,198 @@ async def mapping_preview(req: MappingPreviewRequest, current_user: Dict[str, An
         return { 'mapped': res.output_data.get('mapped'), 'variables': res.variables }
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Preview failed: {e}")
+
+
+@router.get("/{workflow_id}/export")
+async def export_workflow(workflow_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Export a workflow with all its activities as a JSON file.
+    Returns a downloadable JSON file containing the complete workflow definition.
+    """
+    import uuid as _uuid
+    from datetime import datetime
+
+    workflow_uuid = validate_uuid(workflow_id)
+
+    # Get workflow
+    workflow_query = "SELECT * FROM workflows WHERE id = :id AND tenant_id = :tenant_id"
+    workflow = await fetch_one_dict(workflow_query, {
+        "id": str(workflow_uuid),
+        "tenant_id": current_user["tenant_id"]
+    })
+
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    # Get all activities for this workflow
+    activities_query = "SELECT * FROM workflow_activities WHERE workflow_id = :workflow_id ORDER BY order_index"
+    activities = await fetch_all_dict(activities_query, {"workflow_id": str(workflow_uuid)})
+
+    # Parse JSON fields in activities
+    def _ensure_dict(val):
+        if isinstance(val, dict):
+            return val
+        if isinstance(val, str):
+            try:
+                parsed = json.loads(val)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    parsed_activities = []
+    for activity in activities:
+        activity_data = dict(activity)
+        # Remove internal fields
+        for field in ['id', 'workflow_id', 'tenant_id', 'created_at', 'updated_at']:
+            activity_data.pop(field, None)
+
+        # Parse JSON fields
+        activity_data['config'] = _ensure_dict(activity.get('config'))
+        activity_data['input_mapping'] = _ensure_dict(activity.get('input_mapping'))
+        activity_data['output_mapping'] = _ensure_dict(activity.get('output_mapping'))
+        activity_data['error_handling'] = _ensure_dict(activity.get('error_handling'))
+
+        parsed_activities.append(activity_data)
+
+    # Build export data
+    export_data = {
+        "version": "1.0",
+        "exported_at": datetime.utcnow().isoformat() + "Z",
+        "workflow": {
+            "name": workflow.get("name"),
+            "description": workflow.get("description"),
+            "version": workflow.get("version", "1.0.0"),
+            "execution_mode": workflow.get("execution_mode", "REAL_TIME"),
+            "settings": _ensure_dict(workflow.get("settings")),
+            "environment_variables": _ensure_dict(workflow.get("environment_variables")),
+            "max_concurrent_executions": workflow.get("max_concurrent_executions"),
+            "timeout_seconds": workflow.get("timeout_seconds"),
+            "retry_attempts": workflow.get("retry_attempts"),
+            "cron_expression": workflow.get("cron_expression")
+        },
+        "activities": parsed_activities
+    }
+
+    # Return as JSON response with content-disposition header
+    from fastapi.responses import JSONResponse
+
+    filename = f"workflow-{workflow.get('name', 'export')}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.json"
+
+    return JSONResponse(
+        content=export_data,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Type": "application/json"
+        }
+    )
+
+
+class WorkflowImportRequest(BaseModel):
+    workflow_data: Dict[str, Any]
+    name_override: Optional[str] = None
+
+
+@router.post("/import", response_model=Workflow)
+async def import_workflow(import_data: WorkflowImportRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Import a workflow from an exported JSON file.
+    Creates a new workflow with all its activities in the current tenant.
+    """
+    import uuid as _uuid
+
+    def serialize_workflow(workflow: dict) -> dict:
+        # Convert UUID fields to strings
+        for key in ["id", "tenant_id", "created_by_id"]:
+            if key in workflow and isinstance(workflow[key], _uuid.UUID):
+                workflow[key] = str(workflow[key])
+        # Ensure dict fields are valid dictionaries
+        for key in ["settings", "environment_variables"]:
+            if key in workflow and not isinstance(workflow[key], dict):
+                workflow[key] = {}
+        return workflow
+
+    workflow_data = import_data.workflow_data
+
+    # Validate structure
+    if not workflow_data.get("workflow"):
+        raise HTTPException(status_code=400, detail="Invalid workflow export format: missing 'workflow' key")
+
+    if not workflow_data.get("activities"):
+        raise HTTPException(status_code=400, detail="Invalid workflow export format: missing 'activities' key")
+
+    wf = workflow_data["workflow"]
+    activities = workflow_data["activities"]
+
+    # Create new workflow
+    new_workflow_id = str(_uuid.uuid4())
+    workflow_name = import_data.name_override or wf.get("name", "Imported Workflow")
+
+    create_workflow_query = """
+        INSERT INTO workflows (
+            id, tenant_id, created_by_id, name, description, version,
+            status, execution_mode, settings, environment_variables,
+            max_concurrent_executions, timeout_seconds, retry_attempts, cron_expression
+        )
+        VALUES (
+            :id, :tenant_id, :created_by_id, :name, :description, :version,
+            'DRAFT', :execution_mode, :settings, :environment_variables,
+            :max_concurrent_executions, :timeout_seconds, :retry_attempts, :cron_expression
+        )
+        RETURNING *
+    """
+
+    workflow_values = {
+        "id": new_workflow_id,
+        "tenant_id": current_user["tenant_id"],
+        "created_by_id": current_user["id"],
+        "name": workflow_name,
+        "description": wf.get("description"),
+        "version": wf.get("version", "1.0.0"),
+        "execution_mode": wf.get("execution_mode", "REAL_TIME"),
+        "settings": json.dumps(wf.get("settings", {})),
+        "environment_variables": json.dumps(wf.get("environment_variables", {})),
+        "max_concurrent_executions": wf.get("max_concurrent_executions"),
+        "timeout_seconds": wf.get("timeout_seconds"),
+        "retry_attempts": wf.get("retry_attempts"),
+        "cron_expression": wf.get("cron_expression")
+    }
+
+    new_workflow = await fetch_one_dict(create_workflow_query, workflow_values)
+
+    # Create activities
+    for activity in activities:
+        activity_id = str(_uuid.uuid4())
+
+        create_activity_query = """
+            INSERT INTO workflow_activities (
+                id, workflow_id, tenant_id, name, activity_type, description,
+                order_index, is_enabled, config, input_mapping, output_mapping, error_handling
+            )
+            VALUES (
+                :id, :workflow_id, :tenant_id, :name, :activity_type, :description,
+                :order_index, :is_enabled, :config, :input_mapping, :output_mapping, :error_handling
+            )
+            RETURNING id
+        """
+
+        activity_values = {
+            "id": activity_id,
+            "workflow_id": new_workflow_id,
+            "tenant_id": current_user["tenant_id"],
+            "name": activity.get("name"),
+            "activity_type": activity.get("activity_type"),
+            "description": activity.get("description"),
+            "order_index": activity.get("order_index", 0),
+            "is_enabled": activity.get("is_enabled", True),
+            "config": json.dumps(activity.get("config", {})),
+            "input_mapping": json.dumps(activity.get("input_mapping", {})),
+            "output_mapping": json.dumps(activity.get("output_mapping", {})),
+            "error_handling": json.dumps(activity.get("error_handling", {"on_error": "stop", "retry_count": 0}))
+        }
+
+        await fetch_one_dict(create_activity_query, activity_values)
+
+    logger.info(f"Imported workflow {new_workflow_id} with {len(activities)} activities for tenant {current_user['tenant_id']}")
+
+    return serialize_workflow(new_workflow)

@@ -61,6 +61,7 @@ from api.dlq_router import router as dlq_router
 from api.fhir_subscription_router import router as fhir_router
 from api.interop_messages_router import router as interop_messages_router
 from api.dicom_analysis import router as dicom_analysis_router
+from api.websocket_router import router as websocket_router
 
 # Configure logging
 logging.basicConfig(
@@ -249,6 +250,7 @@ app.include_router(dlq_router)
 app.include_router(fhir_router)
 app.include_router(interop_messages_router)
 app.include_router(dicom_analysis_router)
+app.include_router(websocket_router)
 app.include_router(api_router)
 
 # Serve static files (e.g., uploaded logos)

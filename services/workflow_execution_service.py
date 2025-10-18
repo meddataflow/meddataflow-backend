@@ -97,6 +97,8 @@ from processors.ncpdp_processor import (
     process_ncpdp_translator_activity,
     process_ncpdp_sender_activity
 )
+# Import WebSocket manager for real-time updates
+from services.websocket_manager import websocket_manager
 
 logger = logging.getLogger(__name__)
 
@@ -262,11 +264,24 @@ class WorkflowExecutionService:
                 execution_id, workflow_id, tenant_id, user_id, trigger_data
             )
 
+            # Send execution started event via WebSocket
+            await websocket_manager.send_execution_started(
+                execution_id=execution_id,
+                workflow_id=workflow_id,
+                tenant_id=tenant_id,
+                started_at=started_at.isoformat()
+            )
+
             # Execute activities in sequence
             # Skip counter for content-based routing
             if 'skip_next_n' not in context.variables:
                 context.variables['skip_next_n'] = 0
+
+            total_activities = len(activities)
+            activity_index = 0
+
             for activity in activities:
+                activity_index += 1
                 if not activity.get("is_enabled", True):
                     self._log_activity_skip(context, activity)
                     continue
@@ -289,6 +304,26 @@ class WorkflowExecutionService:
                     continue
 
                 context.current_activity = activity["name"]
+
+                # Send activity started event
+                await websocket_manager.send_activity_started(
+                    execution_id=execution_id,
+                    tenant_id=tenant_id,
+                    activity_name=activity["name"],
+                    activity_type=activity.get("activity_type", ""),
+                    activity_index=activity_index
+                )
+
+                # Send progress update
+                progress_percentage = (activity_index / total_activities) * 100
+                await websocket_manager.send_execution_progress(
+                    execution_id=execution_id,
+                    tenant_id=tenant_id,
+                    current_activity=activity_index,
+                    total_activities=total_activities,
+                    progress_percentage=progress_percentage
+                )
+
                 result = await self._execute_activity(activity, context)
 
                 # Update context with results
@@ -296,6 +331,19 @@ class WorkflowExecutionService:
 
                 # Log activity execution
                 self._log_activity_execution(context, activity, result)
+
+                # Send activity completed event
+                await websocket_manager.send_activity_completed(
+                    execution_id=execution_id,
+                    tenant_id=tenant_id,
+                    activity_name=activity["name"],
+                    activity_type=activity.get("activity_type", ""),
+                    activity_index=activity_index,
+                    execution_time_ms=result.execution_time_ms or 0,
+                    status=result.status.value,
+                    output_data=result.output_data if result.status == ActivityStatus.COMPLETED else None,
+                    error_message=result.error_message if result.status == ActivityStatus.FAILED else None
+                )
 
                 # Check for stop workflow flag from condition activities
                 if context.variables.get("stop_workflow"):
@@ -350,6 +398,16 @@ class WorkflowExecutionService:
                 execution_log=context.execution_log
             )
 
+            # Send execution completed event via WebSocket
+            await websocket_manager.send_execution_completed(
+                execution_id=execution_id,
+                tenant_id=tenant_id,
+                status="COMPLETED",
+                execution_time_ms=execution_time_ms,
+                activities_executed=len([log for log in context.execution_log if log["status"] != "skipped"]),
+                activities_skipped=len([log for log in context.execution_log if log["status"] == "skipped"])
+            )
+
             # Collect important outputs from activities for API response
             activity_outputs = {}
             for log_entry in context.execution_log:
@@ -388,15 +446,29 @@ class WorkflowExecutionService:
             # Log error
             logger.error(f"Workflow execution failed: {e}")
 
+            execution_time_ms = int((datetime.utcnow() - started_at).total_seconds() * 1000)
+
             # Update execution record with failure
             await update_execution_record(
                 execution_id,
                 status="FAILED",
                 completed_at=datetime.utcnow(),
-                execution_time_ms=int((datetime.utcnow() - started_at).total_seconds() * 1000),
+                execution_time_ms=execution_time_ms,
                 error_message=str(e),
                 execution_log=context.execution_log if 'context' in locals() else []
             )
+
+            # Send execution failed event via WebSocket
+            if 'context' in locals():
+                await websocket_manager.send_execution_completed(
+                    execution_id=execution_id,
+                    tenant_id=tenant_id,
+                    status="FAILED",
+                    execution_time_ms=execution_time_ms,
+                    activities_executed=len([log for log in context.execution_log if log["status"] != "skipped"]),
+                    activities_skipped=len([log for log in context.execution_log if log["status"] == "skipped"]),
+                    error_message=str(e)
+                )
 
             # Clean up tracking
             if execution_id in self.running_executions:
