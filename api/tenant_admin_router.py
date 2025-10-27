@@ -302,7 +302,8 @@ async def approve_tenant(tenant_id: str):
     except ValueError:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid tenant id")
 
-    tenant = await TenantRepository.get_tenant_by_id(tid)
+    # Use get_tenant_by_id_any_status to get inactive tenants awaiting approval
+    tenant = await TenantRepository.get_tenant_by_id_any_status(tid)
     if not tenant:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
 
@@ -324,10 +325,29 @@ async def approve_tenant(tenant_id: str):
         await execute("UPDATE users SET is_active = TRUE WHERE tenant_id = $1", tid)
     except Exception:
         pass
+
+    # Remove notification entry for this tenant
+    from pathlib import Path
+    notif_path = Path(__file__).resolve().parent.parent / 'config' / 'notifications.json'
+    try:
+        import json as _json
+        existing = []
+        if notif_path.exists():
+            existing = _json.loads(notif_path.read_text()) or []
+        if isinstance(existing, list):
+            # Remove any notifications for this tenant
+            existing = [n for n in existing if str(n.get('tenant_id')) != tenant_id]
+            notif_path.write_text(_json.dumps(existing, indent=2))
+    except Exception:
+        pass
+
     # Send notifications
     try:
         from services.email_service import send_email
         from models.user import UserRepository
+        import logging
+        logger = logging.getLogger(__name__)
+
         supers = await UserRepository.list_super_admin_emails()
         subj_admin = f"Tenant approved: {tenant.get('name')}"
         base_url = os.getenv('PUBLIC_BASE_URL', '').rstrip('/')
@@ -338,16 +358,42 @@ async def approve_tenant(tenant_id: str):
         html_admin = None
         if manage_link:
             html_admin = f"<p>Tenant '<strong>{tenant.get('name')}</strong>' (slug: <code>{tenant.get('slug')}</code>) has been approved and activated.</p><p><a href=\"{manage_link}\">Manage tenants</a></p>"
+
+        # Send to super admins
         for addr in supers:
+            logger.info(f"Sending approval notification to super admin: {addr}")
             send_email(addr, subj_admin, body_admin, html_admin)
-        if tenant.get('billing_email'):
+
+        # Send to tenant admin users
+        tenant_admins_query = """
+        SELECT email FROM users
+        WHERE tenant_id = $1 AND role = 'TENANT_ADMIN' AND is_active = TRUE
+        """
+        tenant_admins = await fetch_all(tenant_admins_query, tid)
+
+        for admin_row in tenant_admins:
+            admin_email = admin_row.get('email')
+            if admin_email:
+                logger.info(f"Sending activation email to tenant admin: {admin_email}")
+                send_email(
+                    admin_email,
+                    "Your MedDataFlow tenant is active",
+                    f"Good news! Your tenant '{tenant.get('name')}' has been approved and is now active. You may log in and begin using the platform.",
+                    f"<p>Good news! Your tenant '<strong>{tenant.get('name')}</strong>' has been approved and is now active.</p><p>You may now <a href=\"{base_url}/auth/login\">log in</a> and begin using the platform.</p>"
+                )
+
+        # Also send to billing email if different
+        if tenant.get('billing_email') and tenant.get('billing_email') not in [a.get('email') for a in tenant_admins]:
+            logger.info(f"Sending activation email to billing contact: {tenant.get('billing_email')}")
             send_email(
                 tenant['billing_email'],
                 "Your MedDataFlow tenant is active",
-                "Your tenant has been approved and is now active. You may log in and begin using the platform.",
-                "<p>Your tenant has been approved and is now active. You may log in and begin using the platform.</p>"
+                f"Your tenant '{tenant.get('name')}' has been approved and is now active.",
+                f"<p>Your tenant '<strong>{tenant.get('name')}</strong>' has been approved and is now active.</p>"
             )
-    except Exception:
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Error sending approval notifications: {e}")
         pass
 
     return {

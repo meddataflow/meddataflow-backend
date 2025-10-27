@@ -175,7 +175,37 @@ async def provision(body: Dict[str, Any]):
         billing['subscription_status'] = 'pending_approval'
         settings['billing'] = billing
         await TenantRepository.update_tenant(tid, settings=settings)
-        # Notify super admins and requester
+
+        # Create notification entry for admin dashboard
+        try:
+            from pathlib import Path
+            from datetime import datetime
+            notif_path = Path(__file__).resolve().parent.parent / 'config' / 'notifications.json'
+            notif_path.parent.mkdir(parents=True, exist_ok=True)
+
+            existing = []
+            if notif_path.exists():
+                try:
+                    existing = _json.loads(notif_path.read_text()) or []
+                except Exception:
+                    existing = []
+
+            # Add new notification
+            new_notif = {
+                "type": "TENANT_PENDING_APPROVAL",
+                "tenant_id": str(tid),
+                "tenant_name": name,
+                "tenant_slug": slug,
+                "timestamp": datetime.utcnow().isoformat() + 'Z',
+                "message": f"Tenant '{name}' is awaiting admin approval"
+            }
+            existing.append(new_notif)
+            notif_path.write_text(_json.dumps(existing, indent=2))
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"Failed to create notification entry: {e}")
+
+        # Notify super admins and requester via email
         try:
             from models.user import UserRepository as UR
             supers = await UR.list_super_admin_emails()
@@ -183,10 +213,22 @@ async def provision(body: Dict[str, Any]):
             body_txt = f"Tenant '{name}' (slug: {slug}) requested activation without payment.\n\nLogin to Admin > Approvals to review."
             for addr in supers:
                 send_email(addr, subj, body_txt)
-            if tenant.get('billing_email'):
+
+            # Send confirmation to admin user
+            send_email(
+                admin_email,
+                "Your tenant activation request is pending",
+                f"Thank you for registering '{name}'.\n\nYour request is pending approval from our team. You will receive an email when your account is activated.",
+                f"<p>Thank you for registering '<strong>{name}</strong>'.</p><p>Your request is pending approval from our team. You will receive an email when your account is activated.</p>"
+            )
+
+            # Also send to billing email if provided and different
+            if tenant.get('billing_email') and tenant.get('billing_email') != admin_email:
                 send_email(tenant['billing_email'], "Your activation request is pending", "We received your request. A MedDataFlow admin will review and activate your tenant.")
-        except Exception:
-            pass
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"Failed to send approval notification emails: {e}")
+
         return {"provisioned": True, "tenant_id": str(tid), "status": "pending_approval"}
 
     elif activation == 'active':
