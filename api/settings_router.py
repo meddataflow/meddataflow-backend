@@ -1,8 +1,8 @@
 """
 Settings router: user and tenant settings management
 """
-from typing import Optional, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File
+from typing import Optional, Dict, Any, List
+from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File, Response
 from pydantic import BaseModel, EmailStr
 import uuid
 from pathlib import Path
@@ -325,6 +325,12 @@ class PlatformBilling(BaseModel):
     stripe_secret_key: Optional[str] = None
     stripe_webhook_secret: Optional[str] = None
 
+class Coupon(BaseModel):
+    code: str
+    percent_off: Optional[float] = None
+    amount_off_cents: Optional[int] = None
+    stripe_coupon_id: Optional[str] = None
+
 def _read_platform_config() -> Dict[str, Any]:
     try:
         if PLATFORM_CONFIG_PATH.exists():
@@ -363,6 +369,17 @@ async def update_platform_billing(payload: PlatformBilling, __: Dict[str, Any] =
     _write_platform_config(cfg)
     return {'updated': True, 'stripe': stripe_cfg}
 
+@router.get("/platform-coupons")
+async def list_platform_coupons(_: Dict[str, Any] = Depends(require_super_admin())):
+    cfg = _read_platform_config()
+    return {"coupons": cfg.get("coupons", [])}
+
+@router.patch("/platform-coupons")
+async def update_platform_coupons(coupons: List[Coupon], __: Dict[str, Any] = Depends(require_super_admin())):
+    cfg = _read_platform_config()
+    cfg["coupons"] = [c.model_dump() for c in coupons]
+    _write_platform_config(cfg)
+    return {"updated": True, "coupons": cfg["coupons"]}
 
 # ----------------------
 # Logo upload endpoints

@@ -358,11 +358,27 @@ class QueueService:
     async def _handle_workflow_execution(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Handle workflow execution task"""
         from database.connection import fetch_one, execute
+        from services.workflow_execution_service import workflow_execution_service
         
         workflow_id = payload["workflow_id"]
         message_id = payload["message_id"]
         raw_message = payload["raw_message"]
         vendor_info = payload["vendor_info"]
+        tenant_id = str(vendor_info.get('tenant_id')) if isinstance(vendor_info, dict) else ""
+        # Make vendor_info JSON-safe by stringifying UUIDs
+        def _stringify(obj: Any) -> Any:
+            try:
+                import uuid as _uuid
+                if isinstance(obj, _uuid.UUID):
+                    return str(obj)
+                if isinstance(obj, dict):
+                    return {k: _stringify(v) for k, v in obj.items()}
+                if isinstance(obj, list):
+                    return [_stringify(v) for v in obj]
+                return obj
+            except Exception:
+                return obj
+        vendor_info_safe = _stringify(vendor_info)
         
         try:
             # Get workflow from database
@@ -378,18 +394,24 @@ class QueueService:
                 message_id
             )
             
-            
             # Prepare trigger data
-            trigger_data = {
+            trigger_data: Dict[str, Any] = {
                 "message_id": message_id,
                 "raw_message": raw_message,
-                "vendor_info": vendor_info,
-                "source": "queue_service"
+                "message": raw_message,
+                "vendor_info": vendor_info_safe,
+                "source": "queue_service",
+                "message_format": vendor_info.get("message_format") if isinstance(vendor_info, dict) else None,
             }
-            
-            # Execute workflow (simplified - would need proper workflow object)
-            execution_id = f"exec_{uuid.uuid4()}"
-            
+
+            # Execute workflow using the main execution service
+            exec_result = await workflow_execution_service.execute_workflow(
+                workflow_id=workflow_id,
+                trigger_data=trigger_data,
+                tenant_id=tenant_id,
+                user_id=None
+            )
+
             # Update message status to processed
             await execute(
                 "UPDATE hl7_messages SET status = 'PROCESSED', processed_at = $2 WHERE id = $1",
@@ -405,7 +427,7 @@ class QueueService:
             
             return {
                 "success": True,
-                "execution_id": execution_id,
+                "execution_id": exec_result.get("execution_id"),
                 "message": "Workflow executed successfully"
             }
             

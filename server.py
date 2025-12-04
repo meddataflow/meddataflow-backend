@@ -45,6 +45,7 @@ from api.workflow_router_new import router as workflow_router
 from api.analytics_router_new import router as analytics_router
 from api.data_table_router_new import router as data_table_router
 from api.vendor_endpoint_router_new import router as vendor_endpoint_router
+from api.vendor_ingestion_router import router as vendor_ingestion_router
 from api.tenant_admin_router import router as tenant_admin_router
 from api.tenant_user_router import router as tenant_user_router
 from api.admin_data_router import router as admin_data_router
@@ -142,7 +143,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:3001").split(","),
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    # Include PATCH so admin coupon updates and other PATCH endpoints work cross-origin
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers", "X-CSRF-Token"],
     max_age=86400  # 24 hours
 )
@@ -234,6 +236,7 @@ app.include_router(workflow_router)
 app.include_router(analytics_router)
 app.include_router(data_table_router)
 app.include_router(vendor_endpoint_router)
+app.include_router(vendor_ingestion_router)
 app.include_router(tenant_admin_router)
 app.include_router(tenant_user_router)
 app.include_router(admin_data_router)

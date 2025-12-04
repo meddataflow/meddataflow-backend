@@ -8,6 +8,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from api.auth_deps import get_current_user, get_current_tenant, require_tenant_admin, get_current_tenant_allow_inactive
+from api.settings_router import _read_platform_config
 from models.tenant import TenantRepository
 from models.hl7_message import HL7MessageRepository
 from models.billing import BillingInvoiceRepository
@@ -48,6 +49,21 @@ def _estimate(plan: str, monthly_messages: int) -> Dict[str, Any]:
         "overage_charges": round(over, 2),
         "estimated_total": round(total, 2),
     }
+
+def _resolve_coupon(code: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not code:
+        return None
+    try:
+        cfg_path = Path(__file__).resolve().parent.parent / 'config' / 'platform_config.json'
+        if cfg_path.exists():
+            cfg = _json.loads(cfg_path.read_text())
+            coupons = cfg.get("coupons") or []
+            for c in coupons:
+                if str(c.get("code", "")).lower() == str(code).lower():
+                    return c
+    except Exception:
+        return None
+    return None
 
 
 @router.get("")
@@ -502,6 +518,7 @@ async def create_stripe_checkout(
     plan_code: str,
     success_url: Optional[str] = None,
     cancel_url: Optional[str] = None,
+    coupon_code: Optional[str] = None,
     current_user: Dict[str, Any] = Depends(require_tenant_admin()),
     current_tenant: Dict[str, Any] = Depends(get_current_tenant_allow_inactive)
 ):
@@ -521,8 +538,12 @@ async def create_stripe_checkout(
         if cfg_path.exists():
             _cfg = _json.loads(cfg_path.read_text())
             secret = (_cfg.get('stripe') or {}).get('secret_key')
+            # Apply coupon lookup from platform config
+            coupon_cfg = _resolve_coupon(coupon_code)
+        else:
+            coupon_cfg = _resolve_coupon(coupon_code)
     except Exception:
-        pass
+        coupon_cfg = _resolve_coupon(coupon_code)
     secret = secret or os.getenv('STRIPE_SECRET_KEY')
     stripe.api_key = secret or ''
     if not stripe.api_key:
@@ -567,15 +588,39 @@ async def create_stripe_checkout(
     def _append_param(url: str, key: str, value: str) -> str:
         return f"{url}{'&' if '?' in url else '?'}{key}={value}"
     success_with_sid = _append_param(success, 'session_id', '{CHECKOUT_SESSION_ID}')
+    discounts = None
     try:
-        session = stripe.checkout.Session.create(
-            mode='subscription',
-            line_items=[{ 'price': price_id, 'quantity': 1 }],
-            client_reference_id=str(tenant_id),
-            customer_email=email,
-            success_url=success_with_sid,
-            cancel_url=cancel,
-        )
+        if coupon_cfg:
+            stripe_coupon_id = coupon_cfg.get("stripe_coupon_id")
+            if not stripe_coupon_id:
+                create_kwargs = {}
+                if coupon_cfg.get("percent_off") is not None:
+                    create_kwargs["percent_off"] = float(coupon_cfg["percent_off"])
+                if coupon_cfg.get("amount_off_cents") is not None:
+                    create_kwargs["amount_off"] = int(coupon_cfg["amount_off_cents"])
+                    create_kwargs["currency"] = 'usd'
+                if create_kwargs:
+                    # Use a recurring/forever coupon so the discount is permanent
+                    create_kwargs["duration"] = "forever"
+                    created_coupon = stripe.Coupon.create(**create_kwargs)
+                    stripe_coupon_id = created_coupon["id"]
+            if stripe_coupon_id:
+                discounts = [{"coupon": stripe_coupon_id}]
+    except Exception:
+        discounts = None
+
+    session_kwargs = dict(
+        mode='subscription',
+        line_items=[{ 'price': price_id, 'quantity': 1 }],
+        client_reference_id=str(tenant_id),
+        customer_email=email,
+        success_url=success_with_sid,
+        cancel_url=cancel,
+    )
+    if discounts:
+        session_kwargs["discounts"] = discounts
+    try:
+        session = stripe.checkout.Session.create(**session_kwargs)
         return { 'url': session['url'] }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Stripe checkout error: {e}")
@@ -584,6 +629,7 @@ async def create_stripe_checkout(
 @router.post("/stripe/checkout/finalize")
 async def finalize_stripe_checkout(
     session_id: str,
+    coupon_code: Optional[str] = None,
     current_user: Dict[str, Any] = Depends(require_tenant_admin()),
     current_tenant: Dict[str, Any] = Depends(get_current_tenant_allow_inactive)
 ):

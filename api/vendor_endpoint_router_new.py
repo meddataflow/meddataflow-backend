@@ -45,7 +45,8 @@ SUPPORTED_MESSAGE_FORMATS = {
     "cda",
     "ccd",
     "ccr",
-    "terminology"
+    "terminology",
+    "csv",
 }
 
 MESSAGE_FORMAT_ALIASES = {
@@ -67,7 +68,8 @@ MESSAGE_FORMAT_ALIASES = {
     "terminology": "terminology",
     "codes": "terminology",
     "json": "terminology",
-    "xml": "cda"
+    "xml": "cda",
+    "csv": "csv",
 }
 
 
@@ -394,11 +396,11 @@ async def update_vendor_endpoint(
         # Prepare update data
         update_data = {}
         for field, value in endpoint_data.dict(exclude_unset=True).items():
-            if value is not None:
-                if field == 'vendor_contact_email' and value:
-                    update_data[field] = str(value)
-                else:
-                    update_data[field] = value
+            # Allow explicit null to clear fields (e.g., trigger_workflow_id)
+            if field == 'vendor_contact_email' and value:
+                update_data[field] = str(value)
+            else:
+                update_data[field] = value
             
         endpoint = await VendorEndpointRepository.update_endpoint(endpoint_uuid, **update_data)
 
@@ -417,6 +419,8 @@ async def update_vendor_endpoint(
             rate_limit_per_hour=endpoint['rate_limit_per_hour'],
             is_active=endpoint['is_active'],
             require_ssl=endpoint['require_ssl'],
+            ack_on_receive=endpoint.get('ack_on_receive', False),
+            ack_profile=endpoint.get('ack_profile'),
             ignored_message_types=_normalize_list_field(endpoint.get('ignored_message_types')),
             total_messages_received=endpoint.get('computed_total_messages') or endpoint.get('total_messages_received', 0),
             total_messages_processed=endpoint.get('computed_processed_messages') or endpoint.get('total_messages_processed', 0),

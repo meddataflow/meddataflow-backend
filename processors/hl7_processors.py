@@ -7,9 +7,11 @@ import io
 import uuid
 import base64
 import logging
+import json
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 from typing import Tuple
+import os
 
 from models.workflow_models import WorkflowContext, ActivityResult, ActivityStatus
 from services.hl7_parser import HL7Parser, ParsedHL7Message
@@ -2325,3 +2327,604 @@ async def _create_extensions_from_z_segments(z_segments: Dict[str, List[str]]) -
             if extension["extension"]:
                 extensions.append(extension)
     return extensions
+
+
+async def process_csv_to_hl7_activity(activity: Dict[str, Any], context: WorkflowContext) -> ActivityResult:
+    """
+    Convert CSV rows into HL7 VXU messages (immunization-focused defaults).
+
+    Config:
+      - delimiter: string (default ",")
+      - has_header: bool (default True)
+      - headers: optional list of header names when has_header is False
+      - field_mappings: { "PID.3.1": "patient_id", "PID.5.1": "last_name", ... }
+      - defaults: { "RXA.5": "998^No Vaccine Administered^CVX" } applied before mappings
+      - csv_text / csv_content: inline CSV payload (falls back to context.csv_content/raw_message)
+      - message_type: default "VXU^V04"
+      - sending_application / sending_facility / receiving_application / receiving_facility
+    """
+    cfg = activity.get("config", {}) or {}
+
+    def _coerce_dict(val: Any) -> Dict[str, Any]:
+        if isinstance(val, dict):
+            return val
+        if isinstance(val, str):
+            try:
+                parsed = json.loads(val)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    delimiter = str(cfg.get("delimiter") or ",")
+    if delimiter == "\\t":
+        delimiter = "\t"
+    has_header = bool(cfg.get("has_header", True))
+    headers_override = cfg.get("headers") or cfg.get("csv_headers")
+    field_mappings = _coerce_dict(cfg.get("field_mappings") or {})
+    default_values = _coerce_dict(cfg.get("defaults") or cfg.get("default_values") or {})
+
+    prefer_config_payload = bool(cfg.get("prefer_config_payload", False))
+
+    # Determine CSV text source:
+    # - If prefer_config_payload, use activity config first
+    # - Otherwise prefer runtime payloads (variables/raw_message) before falling back to config
+    if prefer_config_payload:
+        csv_text = cfg.get("csv_text") or cfg.get("csv_content") or context.variables.get("csv_text") or context.variables.get("csv_content") or context.raw_message
+    else:
+        csv_text = (
+            context.variables.get("csv_text")
+            or context.variables.get("csv_content")
+            or context.raw_message
+            or cfg.get("csv_text")
+            or cfg.get("csv_content")
+        )
+    csv_rows = cfg.get("rows") or context.variables.get("csv_rows")
+
+    if not csv_text and not csv_rows:
+        return ActivityResult(
+            status=ActivityStatus.FAILED,
+            error_message="No CSV input provided for csv_to_hl7 activity"
+        )
+
+    # Parse CSV rows into list of dicts
+    rows: List[Dict[str, Any]] = []
+    try:
+        if csv_rows and isinstance(csv_rows, list):
+            if all(isinstance(r, dict) for r in csv_rows):
+                rows = [dict(r) for r in csv_rows]  # shallow copy
+            elif all(isinstance(r, (list, tuple)) for r in csv_rows):
+                for r in csv_rows:
+                    rows.append({f"col_{i+1}": v for i, v in enumerate(r)})
+        else:
+            stream = io.StringIO(csv_text)
+            if has_header or headers_override:
+                reader = csv.DictReader(stream, delimiter=delimiter, fieldnames=headers_override)
+                for row in reader:
+                    rows.append(dict(row))
+            else:
+                reader = csv.reader(stream, delimiter=delimiter)
+                for row in reader:
+                    rows.append({f"col_{i+1}": v for i, v in enumerate(row)})
+    except Exception as e:
+        logger.error(f"csv_to_hl7: failed to parse CSV: {e}")
+        return ActivityResult(
+            status=ActivityStatus.FAILED,
+            error_message=f"Failed to parse CSV: {str(e)}"
+        )
+
+    if not rows:
+        return ActivityResult(
+            status=ActivityStatus.FAILED,
+            error_message="CSV contained no rows to convert"
+        )
+
+    # Helpers to build HL7 message
+    def _set_path(segments: Dict[str, List[str]], path: str, value: Any) -> None:
+        if value is None:
+            return
+        parts = path.split(".")
+        if len(parts) < 2:
+            return
+        segment = parts[0].strip().upper()
+        try:
+            field_idx = int(parts[1])
+        except ValueError:
+            return
+        component_idx = None
+        if len(parts) > 2:
+            try:
+                component_idx = int(parts[2])
+            except ValueError:
+                component_idx = None
+
+        fields = segments.setdefault(segment, [])
+        pos = max(field_idx - 1, 0)
+        while len(fields) <= pos:
+            fields.append("")
+
+        if component_idx:
+            existing = fields[pos] or ""
+            components = existing.split("^") if existing else []
+            comp_pos = max(component_idx - 1, 0)
+            while len(components) <= comp_pos:
+                components.append("")
+            components[comp_pos] = str(value)
+            fields[pos] = "^".join(components)
+        else:
+            fields[pos] = str(value)
+
+    def _build_message(segments: Dict[str, List[str]]) -> str:
+        order = ["MSH", "PID", "PD1", "NK1", "ORC", "RXA", "RXR", "OBX"]
+        lines: List[str] = []
+        # Ensure MSH is first if present
+        if "MSH" in segments:
+            fields = segments["MSH"]
+            if len(fields) < 2:
+                fields = fields + [""] * (2 - len(fields))
+            if not fields[1]:
+                fields[1] = "^~\\&"
+            # Skip MSH.1 (field separator) – HL7 text already uses pipe separators
+            lines.append("MSH|" + "|".join(fields[1:]))
+
+        for seg in order:
+            if seg == "MSH":
+                continue
+            if seg in segments:
+                lines.append(f"{seg}|" + "|".join(segments[seg]))
+        for seg, fields in segments.items():
+            if seg in order:
+                continue
+            lines.append(f"{seg}|" + "|".join(fields))
+        return "\r".join(lines)
+
+    def _get_value(row: Dict[str, Any], source: Any) -> Any:
+        if row is None:
+            return None
+        if isinstance(source, str) and source in row:
+            return row.get(source)
+        # Allow numeric indexes as strings or ints for headerless CSVs
+        try:
+            idx = int(source)
+            key = list(row.keys())[idx] if idx < len(row) else None
+            return row.get(key) if key else None
+        except Exception:
+            return row.get(str(source)) if isinstance(source, (str, int)) else None
+
+    # Prepare defaults for immunization VXU messages
+    now_ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    message_type = cfg.get("message_type") or "VXU^V04"
+    sending_application = cfg.get("sending_application") or "CSV2HL7"
+    sending_facility = cfg.get("sending_facility") or "CSV_PIPELINE"
+    receiving_application = cfg.get("receiving_application") or "ICARE"
+    receiving_facility = cfg.get("receiving_facility") or "IL-DOH"
+    processing_id = cfg.get("processing_id") or "P"
+    version = cfg.get("version") or "2.5.1"
+
+    hl7_messages: List[str] = []
+    for idx, row in enumerate(rows):
+        segments: Dict[str, List[str]] = {}
+        message_control_id = cfg.get("message_control_id") or f"CSV{uuid.uuid4().hex[:10]}"
+
+        # Baseline defaults
+        _set_path(segments, "MSH.2", "^~\\&")
+        _set_path(segments, "MSH.3", sending_application)
+        _set_path(segments, "MSH.4", sending_facility)
+        _set_path(segments, "MSH.5", receiving_application)
+        _set_path(segments, "MSH.6", receiving_facility)
+        _set_path(segments, "MSH.7", now_ts)
+        _set_path(segments, "MSH.9", message_type)
+        _set_path(segments, "MSH.10", message_control_id)
+        _set_path(segments, "MSH.11", processing_id)
+        _set_path(segments, "MSH.12", version)
+        _set_path(segments, "MSH.15", "AL")
+        _set_path(segments, "MSH.16", "NE")
+
+        _set_path(segments, "ORC.1", "RE")
+        _set_path(segments, "RXA.1", "0")
+        _set_path(segments, "RXA.2", "1")
+        _set_path(segments, "RXA.3", cfg.get("administration_date") or now_ts)
+        _set_path(segments, "RXA.5", cfg.get("vaccine_code") or "998^No Vaccine Administered^CVX")
+
+        # Apply user-provided defaults before field mappings
+        for path, value in default_values.items():
+            _set_path(segments, path, value)
+
+        # Apply field mappings from CSV columns
+        for hl7_path, source in field_mappings.items():
+            val = _get_value(row, source)
+            if val is not None:
+                _set_path(segments, hl7_path, val)
+
+        hl7_messages.append(_build_message(segments))
+
+    # Update workflow context with the first generated message for downstream steps
+    if hl7_messages:
+        context.raw_message = hl7_messages[0]
+        try:
+            context.message = hl7_parser.parse_message(hl7_messages[0])
+        except Exception:
+            context.message = None
+        context.variables["raw_message"] = hl7_messages[0]
+        context.variables["hl7_messages"] = hl7_messages
+
+    return ActivityResult(
+        status=ActivityStatus.COMPLETED,
+        output_data={
+            "message": "CSV converted to HL7",
+            "row_count": len(rows),
+            "hl7_messages": hl7_messages,
+            "sample_message": hl7_messages[0] if hl7_messages else "",
+            "mappings_used": field_mappings
+        },
+        variables={
+            "hl7_messages": hl7_messages,
+            "raw_message": hl7_messages[0] if hl7_messages else None,
+            "csv_row_count": len(rows)
+        }
+    )
+
+
+async def process_icare_sender_activity(activity: Dict[str, Any], context: WorkflowContext) -> ActivityResult:
+    """
+    Send HL7 VXU messages to an ICARE (immunization registry) endpoint over HTTP/S.
+
+    Config:
+      - endpoint_url: required
+      - payload_source: "raw_message" (default) or "hl7_messages"
+      - send_batch: bool (send all hl7_messages if present)
+      - headers: optional dict
+      - auth: { type: "basic"|"bearer", username, password, token }
+      - timeout_seconds: int (default 30)
+      - verify_ssl: bool (default True)
+      - dry_run: bool (if true, do not send – just return payload preview)
+    """
+    cfg = activity.get("config", {}) or {}
+    endpoint = cfg.get("endpoint_url") or cfg.get("url")
+    if not endpoint:
+        return ActivityResult(
+            status=ActivityStatus.FAILED,
+            error_message="ICARE endpoint_url is required"
+        )
+
+    payload_source = cfg.get("payload_source") or "raw_message"
+    send_batch = bool(cfg.get("send_batch", False))
+    timeout = int(cfg.get("timeout_seconds", 30))
+    verify_ssl = bool(cfg.get("verify_ssl", True))
+    expect_ack = bool(cfg.get("expect_ack", True))
+    dry_run = bool(cfg.get("dry_run", False))
+    headers = cfg.get("headers", {}) or {}
+    headers.setdefault("Content-Type", "application/hl7-v2")
+    headers.setdefault("Accept", "application/hl7-v2")
+
+    auth_cfg = cfg.get("auth", {}) or {}
+    auth_type = (auth_cfg.get("type") or "none").lower()
+    auth = None
+    if auth_type == "basic":
+        auth = (auth_cfg.get("username", ""), auth_cfg.get("password", ""))
+    elif auth_type == "bearer":
+        token = auth_cfg.get("token", "")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+    # Resolve payload(s)
+    messages: List[str] = []
+    if payload_source == "hl7_messages":
+        msgs = context.variables.get("hl7_messages")
+        if isinstance(msgs, list):
+            messages = [m for m in msgs if m]
+    if not messages and context.raw_message:
+        messages = [context.raw_message]
+    if not messages and context.variables.get("raw_message"):
+        messages = [context.variables.get("raw_message")]
+
+    if not messages:
+        return ActivityResult(
+            status=ActivityStatus.FAILED,
+            error_message="No HL7 message available to send to ICARE"
+        )
+
+    # Dry run: return without sending
+    if dry_run:
+        return ActivityResult(
+            status=ActivityStatus.COMPLETED,
+            output_data={
+                "message": "Dry-run: ICARE send skipped",
+                "endpoint_url": endpoint,
+                "payload_preview": messages if send_batch else messages[:1],
+                "send_batch": send_batch
+            },
+            variables={"icare_dry_run": True}
+        )
+
+    results: List[Dict[str, Any]] = []
+    success = True
+
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=timeout, verify=verify_ssl) as client:
+            iterable = messages if send_batch else messages[:1]
+            for idx, msg in enumerate(iterable):
+                resp = await client.post(endpoint, data=msg.encode("utf-8"), headers=headers, auth=auth)
+                body_preview = resp.text[:2000] if resp.text else ""
+                entry = {
+                    "status_code": resp.status_code,
+                    "response_text": body_preview,
+                    "request_index": idx,
+                }
+                results.append(entry)
+                if not (200 <= resp.status_code < 300):
+                    success = False
+                    if not send_batch:
+                        break
+    except Exception as e:
+        logger.error(f"icare_sender failed: {e}")
+        return ActivityResult(
+            status=ActivityStatus.FAILED,
+            error_message=f"ICARE send failed: {str(e)}"
+        )
+
+    return ActivityResult(
+        status=ActivityStatus.COMPLETED if success else ActivityStatus.FAILED,
+        output_data={
+            "message": "ICARE send completed" if success else "ICARE send encountered errors",
+            "endpoint_url": endpoint,
+            "results": results,
+            "expect_ack": expect_ack,
+            "send_batch": send_batch
+        },
+        variables={
+            "icare_status": success,
+            "icare_response": results[0] if results else {},
+            "icare_results": results
+        },
+        error_message=None if success else "One or more ICARE requests failed"
+    )
+
+
+async def process_icare_webservice_sender_activity(activity: Dict[str, Any], context: WorkflowContext) -> ActivityResult:
+    """
+    Send HL7 to I-CARE via SOAP Web Service (WSDL/WCF-compatible POST).
+
+    Config:
+      - wsdl_url or endpoint_url: required SOAP endpoint
+      - soap_action: optional SOAPAction header (default empty)
+      - username/password: optional BasicAuth
+      - payload_source: "raw_message" (default) or "hl7_messages"
+      - send_batch: bool (false) to only send first message
+      - timeout_seconds: int (default 30)
+      - verify_ssl: bool (default True)
+      - dry_run: bool to skip network call and return envelope preview
+    """
+    cfg = activity.get("config", {}) or {}
+    endpoint = cfg.get("endpoint_url") or cfg.get("wsdl_url")
+    if not endpoint:
+        return ActivityResult(status=ActivityStatus.FAILED, error_message="ICARE webservice endpoint_url/wsdl_url is required")
+
+    payload_source = cfg.get("payload_source") or "raw_message"
+    send_batch = bool(cfg.get("send_batch", False))
+    timeout = int(cfg.get("timeout_seconds", 30))
+    verify_ssl = bool(cfg.get("verify_ssl", True))
+    soap_action = cfg.get("soap_action") or ""
+    dry_run = bool(cfg.get("dry_run", False))
+    username = cfg.get("username")
+    password = cfg.get("password")
+
+    # Resolve payload(s)
+    messages: List[str] = []
+    if payload_source == "hl7_messages":
+        msgs = context.variables.get("hl7_messages")
+        if isinstance(msgs, list):
+            messages = [m for m in msgs if m]
+    if not messages and context.raw_message:
+        messages = [context.raw_message]
+    if not messages and context.variables.get("raw_message"):
+        messages = [context.variables.get("raw_message")]
+
+    if not messages:
+        return ActivityResult(status=ActivityStatus.FAILED, error_message="No HL7 message available to send to I-CARE webservice")
+
+    iterable = messages if send_batch else messages[:1]
+    results: List[Dict[str, Any]] = []
+    success = True
+
+    def _build_envelope(message: str) -> str:
+        # Minimal SOAP 1.1 envelope expected by many IIS endpoints; adjust as needed via config if spec changes.
+        return f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <SubmitSingleMessage xmlns="http://tempuri.org/">
+      <hl7Message>{message}</hl7Message>
+    </SubmitSingleMessage>
+  </soap:Body>
+</soap:Envelope>"""
+
+    if dry_run:
+        preview = _build_envelope(iterable[0])
+        return ActivityResult(
+            status=ActivityStatus.COMPLETED,
+            output_data={
+                "message": "Dry-run: ICARE webservice call skipped",
+                "endpoint_url": endpoint,
+                "payload_preview": preview[:2000],
+                "send_batch": send_batch
+            },
+            variables={"icare_webservice_dry_run": True}
+        )
+
+    try:
+        import httpx
+        auth = None
+        if username or password:
+            auth = (username or "", password or "")
+
+        headers = {
+            "Content-Type": "text/xml; charset=utf-8",
+        }
+        if soap_action is not None:
+            headers["SOAPAction"] = soap_action
+
+        async with httpx.AsyncClient(timeout=timeout, verify=verify_ssl) as client:
+            for idx, msg in enumerate(iterable):
+                envelope = _build_envelope(msg)
+                resp = await client.post(endpoint, data=envelope.encode("utf-8"), headers=headers, auth=auth)
+                body_preview = resp.text[:2000] if resp.text else ""
+                entry = {
+                    "status_code": resp.status_code,
+                    "response_text": body_preview,
+                    "request_index": idx,
+                }
+                results.append(entry)
+                if not (200 <= resp.status_code < 300):
+                    success = False
+                    if not send_batch:
+                        break
+    except Exception as e:
+        logger.error(f"ICARE webservice send failed: {e}")
+        return ActivityResult(
+            status=ActivityStatus.FAILED,
+            error_message=f"ICARE webservice send failed: {str(e)}"
+        )
+
+    return ActivityResult(
+        status=ActivityStatus.COMPLETED if success else ActivityStatus.FAILED,
+        output_data={
+            "message": "ICARE webservice send completed" if success else "ICARE webservice send encountered errors",
+            "endpoint_url": endpoint,
+            "results": results,
+            "send_batch": send_batch
+        },
+        variables={
+            "icare_webservice_status": success,
+            "icare_webservice_response": results[0] if results else {},
+            "icare_webservice_results": results
+        },
+        error_message=None if success else "One or more ICARE webservice requests failed"
+    )
+
+
+async def process_icare_sftp_sender_activity(activity: Dict[str, Any], context: WorkflowContext) -> ActivityResult:
+    """
+    Upload HL7 batch file to I-CARE over SFTP/FTP.
+
+    Config:
+      - host: required (e.g., ftp.idphnet.com)
+      - port: optional (default 22 for sftp, 21 for ftp)
+      - username / password: required
+      - protocol: "sftp" (default) or "ftp"
+      - directory: target directory (default "/Distribution/ICARE HL7 EXCHANGE/")
+      - filename_template: supports {date}, {timestamp}, {facility}, {random}
+      - facility: used in filename substitution (default "TEST")
+      - send_batch: bool (default True) to use hl7_messages array; otherwise raw_message
+      - dry_run: bool to skip upload and just return the composed payload
+    """
+    cfg = activity.get("config", {}) or {}
+    host = cfg.get("host")
+    username = cfg.get("username")
+    password = cfg.get("password")
+    protocol = (cfg.get("protocol") or "sftp").lower()
+    directory = cfg.get("directory") or "/Distribution/ICARE HL7 EXCHANGE/"
+    facility = cfg.get("facility") or "TEST"
+    send_batch = bool(cfg.get("send_batch", True))
+    dry_run = bool(cfg.get("dry_run", False))
+    filename_template = cfg.get("filename_template") or "HL7_{facility}_{date}_{timestamp}.txt"
+    allow_unknown_hosts = bool(cfg.get("allow_unknown_hosts", False))
+
+    if not host or not username or not password:
+        return ActivityResult(
+            status=ActivityStatus.FAILED,
+            error_message="ICARE SFTP requires host, username, and password"
+        )
+
+    # Resolve messages
+    messages: List[str] = []
+    if send_batch:
+        msgs = context.variables.get("hl7_messages")
+        if isinstance(msgs, list):
+            messages = [m for m in msgs if m]
+    if not messages and context.raw_message:
+        messages = [context.raw_message]
+    if not messages and context.variables.get("raw_message"):
+        messages = [context.variables.get("raw_message")]
+
+    if not messages:
+        return ActivityResult(
+            status=ActivityStatus.FAILED,
+            error_message="No HL7 message available to upload to I-CARE"
+        )
+
+    date_str = datetime.utcnow().strftime("%Y%m%d")
+    ts_str = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    rand_str = uuid.uuid4().hex[:8]
+    filename = filename_template
+    for k, v in {
+        "date": date_str,
+        "timestamp": ts_str,
+        "facility": facility,
+        "random": rand_str,
+    }.items():
+        filename = filename.replace(f"{{{k}}}", str(v)).replace(f"{{{{{k}}}}}", str(v))
+    remote_path = os.path.join(directory.rstrip("/"), filename)
+
+    content = "\r\n".join(msg.strip() for msg in messages if isinstance(msg, str))
+    if not content.endswith("\r\n"):
+        content = content + "\r\n"
+
+    if dry_run:
+        return ActivityResult(
+            status=ActivityStatus.COMPLETED,
+            output_data={
+                "message": "Dry-run: ICARE SFTP upload skipped",
+                "host": host,
+                "path": remote_path,
+                "message_count": len(messages),
+                "protocol": protocol
+            },
+            variables={"icare_sftp_dry_run": True, "icare_sftp_path": remote_path}
+        )
+
+    bytes_written = len(content.encode("utf-8"))
+
+    try:
+        if protocol == "ftp":
+            import aioftp
+            async with aioftp.Client.context(host, port=cfg.get("port", 21), user=username, password=password) as client:
+                try:
+                    await client.make_directory(directory)
+                except Exception:
+                    pass  # likely already exists
+                await client.upload_stream(io.BytesIO(content.encode("utf-8")), remote_path)
+        else:
+            import asyncssh
+            port = int(cfg.get("port", 22))
+            async with asyncssh.connect(host, port=port, username=username, password=password, known_hosts=None if allow_unknown_hosts else None) as conn:
+                async with conn.start_sftp_client() as sftp:
+                    try:
+                        await sftp.makedirs(directory)
+                    except Exception:
+                        pass
+                    async with sftp.open(remote_path, "w") as f:
+                        await f.write(content)
+    except Exception as e:
+        logger.error(f"ICARE SFTP upload failed: {e}")
+        return ActivityResult(
+            status=ActivityStatus.FAILED,
+            error_message=f"ICARE SFTP upload failed: {str(e)}"
+        )
+
+    return ActivityResult(
+        status=ActivityStatus.COMPLETED,
+        output_data={
+            "message": "ICARE SFTP upload completed",
+            "host": host,
+            "path": remote_path,
+            "bytes_written": bytes_written,
+            "message_count": len(messages),
+            "protocol": protocol
+        },
+        variables={
+            "icare_sftp_path": remote_path,
+            "icare_sftp_bytes": bytes_written
+        }
+    )

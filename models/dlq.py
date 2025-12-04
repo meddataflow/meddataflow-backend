@@ -18,6 +18,12 @@ class DLQRepository:
         max_retries: int = 0,
         next_attempt_at: Optional[datetime] = None,
     ) -> Dict[str, Any]:
+        # Ensure payload is JSON-serializable
+        try:
+            import json as _json
+            payload = _json.dumps(payload or {})
+        except Exception:
+            payload = "{}"
         return await fetch_one_dict(
             """
             INSERT INTO dlq_messages (tenant_id, workflow_id, execution_id, activity_id, activity_name,
@@ -79,4 +85,3 @@ class DLQRepository:
     async def delete(item_id: uuid.UUID, tenant_id: uuid.UUID) -> bool:
         await execute_dict("DELETE FROM dlq_messages WHERE id = :id AND tenant_id = :tenant_id", {'id': str(item_id), 'tenant_id': str(tenant_id)})
         return True
-

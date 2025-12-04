@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks, UploadFile, File, Form
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import logging
 from typing import Optional, Dict, Any, List
@@ -30,7 +30,8 @@ SUPPORTED_MESSAGE_FORMATS = {
     "cda",
     "ccd",
     "ccr",
-    "terminology"
+    "terminology",
+    "csv",
 }
 
 MESSAGE_FORMAT_ALIASES = {
@@ -52,7 +53,8 @@ MESSAGE_FORMAT_ALIASES = {
     "terminology": "terminology",
     "codes": "terminology",
     "json": "terminology",
-    "xml": "cda"
+    "xml": "cda",
+    "csv": "csv",
 }
 
 
@@ -133,14 +135,14 @@ async def check_rate_limit(vendor_info: Dict[str, Any], request: Request) -> boo
     
     return True
 
-@router.post("/{vendor_slug}/{format_slug}/ingest")
-async def ingest_vendor_message(
+async def _ingest_vendor_message_internal(
     vendor_slug: str,
     format_slug: str,
     request: Request,
     background_tasks: BackgroundTasks,
-    raw_message: str,
-    vendor_info: Dict[str, Any] = Depends(validate_api_key)
+    raw_message: Optional[str],
+    file: Optional[UploadFile],
+    vendor_info: Dict[str, Any]
 ):
     """
     Secure HL7 message ingestion endpoint for vendors
@@ -155,6 +157,12 @@ async def ingest_vendor_message(
     """
 
     # Input validation and security checks
+    if (not raw_message or not isinstance(raw_message, str)) and file:
+        try:
+            content_bytes = await file.read()
+            raw_message = content_bytes.decode("utf-8", errors="replace")
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Failed to read uploaded file: {exc}")
     if not raw_message or not isinstance(raw_message, str):
         raise HTTPException(status_code=400, detail="Invalid message format")
 
@@ -198,6 +206,8 @@ async def ingest_vendor_message(
 
         # Plan/subscription enforcement
         tenant = await TenantRepository.get_tenant_by_id(vendor_info['tenant_id'])
+        if not isinstance(tenant, dict):
+            tenant = {}
         plan = (tenant.get('plan') or 'PROFESSIONAL').upper()
         from datetime import timezone
         start_month = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -205,9 +215,10 @@ async def ingest_vendor_message(
         monthly_usage = await fetch_one("SELECT COUNT(*) AS c FROM hl7_messages WHERE tenant_id = $1 AND created_at >= $2", vendor_info['tenant_id'], start_month)
         usage_count = monthly_usage['c'] if monthly_usage else 0
         plan_included = {'FREE': 1000, 'PROFESSIONAL': 100000, 'ENTERPRISE': 2000000}.get(plan, 100000)
-        billing_settings = ((tenant.get('settings') or {}).get('billing') or {})
+        billing_settings = ((tenant.get('settings') or {}).get('billing') or {}) if isinstance(tenant.get('settings'), dict) else {}
         billing_exempt = bool(billing_settings.get('billing_exempt', False))
-        subscription_status = (billing_settings.get('subscription_status') or '').lower()
+        # If no subscription status is present, treat as active to avoid blocking ingestion in non-billed environments
+        subscription_status = (billing_settings.get('subscription_status') or 'active').lower()
         # Require subscription for paid plans unless exempt or trialing
         if plan != 'FREE' and not billing_exempt and subscription_status not in ('active', 'trialing'):
             raise HTTPException(status_code=402, detail="Subscription required for this tenant. Please subscribe or contact support.")
@@ -516,6 +527,22 @@ async def _process_non_hl7_message(
         response_data["note"] = "No workflow configured for this vendor endpoint"
 
     return response_data
+
+
+@router.post("/{vendor_slug}/{format_slug}/ingest")
+async def ingest_vendor_message(
+    vendor_slug: str,
+    format_slug: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    raw_message: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+    vendor_info: Dict[str, Any] = Depends(validate_api_key)
+):
+    """Generic ingestion endpoint for any supported format (uses path format slug)."""
+    return await _ingest_vendor_message_internal(
+        vendor_slug, format_slug, request, background_tasks, raw_message, file, vendor_info
+    )
 
 async def trigger_workflow_async(
     workflow_id: str,

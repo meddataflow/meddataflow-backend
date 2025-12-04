@@ -134,6 +134,7 @@ COMMON PATTERNS:
 2. Data Export: hl7_parser → csv_converter → s3_storage
 3. Integration: hl7_parser → transform → http_sender
 4. Validation: hl7_parser → validation → conditional processing
+5. CSV → HL7 immunization: csv_to_hl7 → icare_sftp_sender (batch upload)
 
 Be specific with configurations and make sure all required fields are included.
 """
@@ -167,6 +168,47 @@ Be specific with configurations and make sure all required fields are included.
                         "mappings": {"patient_id": {"source_location": "PID.3", "default_value": ""}},
                         "csv_headers": ["patient_id"],
                         "field_mappings": "{\"patient_id\": \"PID.3\"}"
+                    }
+                },
+                "csv_to_hl7": {
+                    "description": "Convert CSV rows into HL7 VXU messages (immunization-focused)",
+                    "config_schema": {
+                        "delimiter": ",",
+                        "has_header": True,
+                        "message_type": "VXU^V04",
+                        "version": "2.5.1",
+                        "sending_facility": "TEST",
+                        "field_mappings": {
+                            "PID.3.1": "patient_id",
+                            "PID.5.1": "last_name",
+                            "PID.5.2": "first_name",
+                            "RXA.3": "admin_datetime",
+                            "RXA.5": "cvx_code",
+                            "RXA.9": "action_code",
+                            "RXA.11": "admin_by",
+                            "RXA.15": "lot",
+                            "RXA.17": "mvx"
+                        },
+                        "defaults": {
+                            "MSH.4": "TEST",
+                            "MSH.15": "AL",
+                            "MSH.16": "NE",
+                            "RXA.5": "998^No Vaccine Administered^CVX"
+                        }
+                    }
+                },
+                "icare_sftp_sender": {
+                    "description": "Upload HL7 batch file to ICARE over SFTP/FTP",
+                    "config_schema": {
+                        "host": "ftp.idphnet.com",
+                        "protocol": "sftp",
+                        "username": "777xxxx",
+                        "password": "REPLACE_ME",
+                        "directory": "/Distribution/ICARE HL7 EXCHANGE/",
+                        "filename_template": "HL7_{facility}_{date}_{timestamp}.txt",
+                        "facility": "TEST",
+                        "send_batch": True,
+                        "dry_run": True
                     }
                 },
                 "segment_loop": {

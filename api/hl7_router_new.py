@@ -25,7 +25,7 @@ class HL7MessageResponse(BaseModel):
     direction: str
     raw_message: Optional[str] = None
     created_at: datetime
-    updated_at: datetime
+    updated_at: Optional[datetime] = None
 
 class HL7MessageCreate(BaseModel):
     raw_message: str

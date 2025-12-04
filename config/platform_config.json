@@ -3,5 +3,13 @@
     "publishable_key": "pk_test_51RiI3aQuhftSFWcZr8z866IDodLmu42PxdZqpDmj4Xx5dFzeiW3MhLvhhiFU5x28V05IiGpP995crd5EXNQoGVih00PWR4fB3D",
     "secret_key": "sk_test_51RiI3aQuhftSFWcZhK16d5g1nqz8GvuLcS5d1zQYZvFZJuF7RqVOwclljNPjFHJAankNaq2QuJCI0rnddJkPIJj300zWAev0lM",
     "webhook_secret": "whsec_CXz3FqkykBUoL7Kpt0DmTPjKJbv9pPuJ"
-  }
+  },
+  "coupons": [
+    {
+      "code": "VOX",
+      "percent_off": 13.3,
+      "amount_off_cents": null,
+      "stripe_coupon_id": ""
+    }
+  ]
 }

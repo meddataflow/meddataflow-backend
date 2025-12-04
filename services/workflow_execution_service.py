@@ -49,7 +49,9 @@ from processors.file_processors import (
 from processors.hl7_processors import (
     process_hl7_parser_activity, process_hl7_transformer_activity,
     process_hl7_to_fhir_activity, process_hl7_to_csv_activity,
-    process_segment_loop_activity, process_hl7_ack_activity
+    process_segment_loop_activity, process_hl7_ack_activity,
+    process_csv_to_hl7_activity, process_icare_sender_activity,
+    process_icare_sftp_sender_activity, process_icare_webservice_sender_activity
 )
 from processors.control_processors import (
     process_validation_activity, process_condition_activity,
@@ -169,8 +171,12 @@ class WorkflowExecutionService:
             "hl7_transformer": process_hl7_transformer_activity,
             "hl7_to_fhir": process_hl7_to_fhir_activity,
             "hl7_to_csv": process_hl7_to_csv_activity,
+            "csv_to_hl7": process_csv_to_hl7_activity,
             "segment_loop": process_segment_loop_activity,
             "hl7_ack": process_hl7_ack_activity,
+            "icare_sender": process_icare_sender_activity,
+            "icare_webservice_sender": process_icare_webservice_sender_activity,
+            "icare_sftp_sender": process_icare_sftp_sender_activity,
 
             # EMR Sender Activities
             "ecw_fhir_sender": process_ecw_fhir_sender_activity,
@@ -419,7 +425,8 @@ class WorkflowExecutionService:
                             "transformed_message", "parsed_message", "parsed_segments",
                             "csv_data", "fhir_bundle", "readable_text", "extracted_variables",
                             "loop_results", "validation_results", "mapped_data", "converted_data",
-                            "code_output", "execution_result", "script_output"
+                            "code_output", "execution_result", "script_output", "hl7_messages",
+                            "icare_response", "icare_results"
                         ]
                         for key in important_keys:
                             if key in output_data:
