@@ -104,6 +104,8 @@ db/
 secrets/
 credentials/
 keys/
+# Allow checked-in secret resolver helper (no secrets stored here)
+!services/secrets.py
 
 # VPN configurations (SECURITY CRITICAL)
 *.ovpn

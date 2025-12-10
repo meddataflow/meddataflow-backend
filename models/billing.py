@@ -18,13 +18,22 @@ class BillingInvoiceRepository:
         status: str = 'draft',
         payload: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        import json
+        payload_json = payload
+        if payload is None:
+            payload_json = json.dumps({})
+        else:
+            try:
+                payload_json = json.dumps(payload)
+            except Exception:
+                payload_json = json.dumps({})
         query = """
         INSERT INTO billing_invoices (tenant_id, provider, external_id, period_start, period_end, amount_cents, currency, status, payload, created_at, updated_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
         RETURNING *
         """
         now = datetime.now(timezone.utc)
-        return await execute_returning(query, tenant_id, provider, external_id, period_start, period_end, amount_cents, currency, status, payload or {}, now)
+        return await execute_returning(query, tenant_id, provider, external_id, period_start, period_end, amount_cents, currency, status, payload_json, now)
 
     @staticmethod
     async def get_latest_invoice(tenant_id: uuid.UUID) -> Optional[Dict[str, Any]]:

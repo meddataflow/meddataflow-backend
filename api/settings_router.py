@@ -325,6 +325,14 @@ class PlatformBilling(BaseModel):
     stripe_secret_key: Optional[str] = None
     stripe_webhook_secret: Optional[str] = None
 
+class PlatformEmail(BaseModel):
+    smtp_host: Optional[str] = None
+    smtp_port: Optional[int] = None
+    smtp_user: Optional[str] = None
+    smtp_password: Optional[str] = None
+    smtp_from: Optional[str] = None
+    smtp_tls: Optional[bool] = None
+
 class Coupon(BaseModel):
     code: str
     percent_off: Optional[float] = None
@@ -368,6 +376,53 @@ async def update_platform_billing(payload: PlatformBilling, __: Dict[str, Any] =
     cfg['stripe'] = stripe_cfg
     _write_platform_config(cfg)
     return {'updated': True, 'stripe': stripe_cfg}
+
+@router.get("/platform-email")
+async def get_platform_email(_: Dict[str, Any] = Depends(require_super_admin())):
+    cfg = _read_platform_config()
+    email_cfg = cfg.get('email') or {}
+    return {
+        "smtp_host": email_cfg.get("smtp_host"),
+        "smtp_port": email_cfg.get("smtp_port"),
+        "smtp_user": email_cfg.get("smtp_user"),
+        "smtp_from": email_cfg.get("smtp_from"),
+        "smtp_tls": email_cfg.get("smtp_tls", True),
+        # Never return password
+        "has_password": bool(email_cfg.get("smtp_password")),
+    }
+
+@router.patch("/platform-email")
+async def update_platform_email(payload: PlatformEmail, __: Dict[str, Any] = Depends(require_super_admin())):
+    cfg = _read_platform_config()
+    email_cfg = dict(cfg.get('email') or {})
+    if payload.smtp_host is not None:
+        email_cfg['smtp_host'] = payload.smtp_host
+    if payload.smtp_port is not None:
+        email_cfg['smtp_port'] = payload.smtp_port
+    if payload.smtp_user is not None:
+        email_cfg['smtp_user'] = payload.smtp_user
+    if payload.smtp_password is not None:
+        email_cfg['smtp_password'] = payload.smtp_password
+    if payload.smtp_from is not None:
+        email_cfg['smtp_from'] = payload.smtp_from
+    if payload.smtp_tls is not None:
+        email_cfg['smtp_tls'] = payload.smtp_tls
+    cfg['email'] = email_cfg
+    _write_platform_config(cfg)
+    return {"updated": True, "email": {k: v for k, v in email_cfg.items() if k != "smtp_password"}}
+
+class EmailTest(BaseModel):
+    to: EmailStr
+    subject: Optional[str] = "Test email from MedDataFlow"
+    body: Optional[str] = "This is a test email from MedDataFlow SMTP settings."
+
+@router.post("/platform-email/test")
+async def test_platform_email(payload: EmailTest, __: Dict[str, Any] = Depends(require_super_admin())):
+    from services.email_service import send_email
+    ok = send_email(payload.to, payload.subject or "Test email", payload.body or "Test")
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to send test email. Check SMTP settings.")
+    return {"sent": True}
 
 @router.get("/platform-coupons")
 async def list_platform_coupons(_: Dict[str, Any] = Depends(require_super_admin())):

@@ -1,8 +1,9 @@
 """
 Billing endpoints: tenant billing settings and usage/estimate
 """
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
+import asyncio
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -12,18 +13,22 @@ from api.settings_router import _read_platform_config
 from models.tenant import TenantRepository
 from models.hl7_message import HL7MessageRepository
 from models.billing import BillingInvoiceRepository
+from models.user import UserRepository
 import os
 import hmac
 import hashlib
 from fastapi import Request
 from pathlib import Path
 import json as _json
+from services.email_service import send_email
 try:
     import stripe
 except Exception:
     stripe = None
 
 router = APIRouter(prefix="/api/billing", tags=["billing"])
+import logging
+logger = logging.getLogger(__name__)
 
 
 def _month_start(dt: datetime) -> datetime:
@@ -65,6 +70,125 @@ def _resolve_coupon(code: Optional[str]) -> Optional[Dict[str, Any]]:
         return None
     return None
 
+
+async def _send_invoice_email(
+    tenant_id: uuid.UUID,
+    tenant_name: str,
+    invoice_obj: Dict[str, Any],
+    status_label: str,
+) -> None:
+    """Send an invoice email to the tenant billing contact (or super admins fallback)."""
+    to_addrs: List[str] = []
+    tenant = await TenantRepository.get_tenant_by_id_any_status(tenant_id)
+    billing_email = tenant.get("billing_email")
+    if billing_email:
+        to_addrs.append(billing_email)
+    # Fallback to invoice email if present
+    inv_email = invoice_obj.get("customer_email")
+    if inv_email and inv_email not in to_addrs:
+        to_addrs.append(inv_email)
+    if not to_addrs:
+        try:
+            to_addrs = await UserRepository.list_super_admin_emails()
+        except Exception:
+            to_addrs = []
+    if not to_addrs:
+        logger.warning("No recipient for invoice email; billing_email and super_admins missing")
+        return
+    logger.info(f"Invoice email recipients: {to_addrs}")
+
+    amount_cents = invoice_obj.get("amount_paid") or invoice_obj.get("amount_due") or invoice_obj.get("amount_total") or 0
+    currency = (invoice_obj.get("currency") or "usd").upper()
+    amount = f"{amount_cents/100:.2f} {currency}"
+    hosted_url = invoice_obj.get("hosted_invoice_url") or invoice_obj.get("invoice_pdf")
+    period = invoice_obj.get("lines", {}).get("data", [{}])[0].get("period", {}) if invoice_obj.get("lines") else {}
+    start = period.get("start"); end = period.get("end")
+    start_str = datetime.fromtimestamp(start, tz=timezone.utc).date().isoformat() if start else "N/A"
+    end_str = datetime.fromtimestamp(end, tz=timezone.utc).date().isoformat() if end else "N/A"
+    subject = f"[Billing] Invoice {status_label} for {tenant_name}"
+    body = (
+        f"Hello,\n\n"
+        f"An invoice has been {status_label.lower()} for {tenant_name}.\n"
+        f"Amount: {amount}\n"
+        f"Period: {start_str} to {end_str}\n"
+        f"Status: {invoice_obj.get('status', 'unknown')}\n"
+    )
+    if hosted_url:
+        body += f"Invoice link: {hosted_url}\n"
+    body += "\nThanks,\nMedDataFlow Billing"
+
+    link_html = ""
+    if hosted_url:
+        link_html = (
+            f'<a href="{hosted_url}" style="display:inline-flex; align-items:center; gap:8px; '
+            'background:#0f62fe; color:#fff; text-decoration:none; padding:10px 14px; '
+            'border-radius:10px; font-weight:600;">View invoice online</a>'
+        )
+
+    html = f"""
+    <div style="font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:#0f172a; padding:24px;">
+      <div style="max-width:640px; margin:0 auto; background:#ffffff; border-radius:14px; overflow:hidden; box-shadow:0 12px 30px rgba(15,23,42,0.18);">
+        <div style="background:linear-gradient(135deg,#0f62fe,#0b5ad1); padding:18px 20px; color:#fff; display:flex; align-items:center; justify-content:space-between;">
+          <div>
+            <div style="font-size:13px; opacity:0.9; letter-spacing:0.3px;">MedDataFlow</div>
+            <div style="font-size:20px; font-weight:700; margin-top:2px;">Invoice {status_label.title()}</div>
+          </div>
+          <div style="font-size:13px; text-align:right; opacity:0.9;">
+            <div>{invoice_obj.get('number') or invoice_obj.get('id')}</div>
+            <div style="margin-top:2px;">{invoice_obj.get('customer_email') or ''}</div>
+          </div>
+        </div>
+        <div style="padding:22px 22px 10px 22px; color:#0f172a;">
+          <p style="margin:0 0 12px 0; font-size:15px;">Hi,</p>
+          <p style="margin:0 0 16px 0; font-size:15px;">An invoice has been <strong>{status_label.lower()}</strong> for <strong>{tenant_name}</strong>.</p>
+          <div style="border:1px solid #e2e8f0; border-radius:12px; overflow:hidden; margin-bottom:16px;">
+            <table style="width:100%; border-collapse:collapse; font-size:14px;">
+              <tr style="background:#f8fafc;">
+                <td style="padding:10px 12px; font-weight:600; color:#0f172a;">Amount</td>
+                <td style="padding:10px 12px;">{amount}</td>
+              </tr>
+              <tr>
+                <td style="padding:10px 12px; font-weight:600; color:#0f172a;">Period</td>
+                <td style="padding:10px 12px;">{start_str} to {end_str}</td>
+              </tr>
+              <tr style="background:#f8fafc;">
+                <td style="padding:10px 12px; font-weight:600; color:#0f172a;">Status</td>
+                <td style="padding:10px 12px; text-transform:capitalize;">{invoice_obj.get('status', 'unknown')}</td>
+              </tr>
+              <tr>
+                <td style="padding:10px 12px; font-weight:600; color:#0f172a;">Invoice #</td>
+                <td style="padding:10px 12px;">{invoice_obj.get('number') or invoice_obj.get('id')}</td>
+              </tr>
+            </table>
+          </div>
+          {link_html}
+          <p style="margin:18px 0 0 0; font-size:14px; color:#334155;">You will also find the PDF attached for your records.</p>
+          <p style="margin:8px 0 0 0; font-size:14px; color:#334155;">Thanks,<br/>MedDataFlow Billing</p>
+        </div>
+        <div style="background:#f8fafc; padding:12px 18px; color:#64748b; font-size:12px; text-align:center;">
+          MedDataFlow • Automated billing notice
+        </div>
+      </div>
+    </div>
+    """
+
+    attachments = []
+    invoice_pdf = invoice_obj.get("invoice_pdf")
+    if invoice_pdf:
+        try:
+            import requests
+            resp = requests.get(invoice_pdf, timeout=10)
+            if resp.status_code == 200:
+                attachments.append({
+                    "filename": f"{invoice_obj.get('number') or invoice_obj.get('id')}.pdf",
+                    "content": resp.content,
+                    "mime_type": "application/pdf"
+                })
+        except Exception:
+            logger.warning("Failed to download invoice PDF for attachment")
+
+    for addr in to_addrs:
+        send_email(addr, subject, body, html, attachments=attachments)
 
 @router.get("")
 async def get_billing(
@@ -426,7 +550,7 @@ async def stripe_webhook(request: Request):
             settings['billing'] = billing
             await TenantRepository.update_tenant(tid, settings=settings)
 
-    # Record invoices (paid/finalized)
+    # Record invoices (paid/finalized) and send invoice email
     if event_type in ('invoice.paid', 'invoice.finalized'):
         if not tenant_id and customer_id:
             tenant_id = await _resolve_tenant_by_customer(customer_id)
@@ -448,6 +572,30 @@ async def stripe_webhook(request: Request):
                 currency=(obj.get('currency') or 'usd').upper(),
                 payload=data,
             )
+            try:
+                await _send_invoice_email(
+                    tenant_id=tenant_id,
+                    tenant_name=tenant.get('name') if (tenant := await TenantRepository.get_tenant_by_id_any_status(tenant_id)) else "your account",
+                    invoice_obj=obj,
+                    status_label="paid" if event_type == "invoice.paid" else "issued",
+                )
+            except Exception:
+                pass
+
+    # Payment failure / reminder
+    if event_type in ('invoice.payment_failed', 'invoice.payment_action_required'):
+        if not tenant_id and customer_id:
+            tenant_id = await _resolve_tenant_by_customer(customer_id)
+        if tenant_id:
+            try:
+                await _send_invoice_email(
+                    tenant_id=tenant_id,
+                    tenant_name=tenant.get('name') if (tenant := await TenantRepository.get_tenant_by_id_any_status(tenant_id)) else "your account",
+                    invoice_obj=obj,
+                    status_label="payment failed",
+                )
+            except Exception:
+                pass
 
     # Update subscription status lifecycle
     if event_type in ('customer.subscription.created', 'customer.subscription.updated', 'customer.subscription.deleted'):
@@ -656,12 +804,18 @@ async def finalize_stripe_checkout(
         raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY not configured")
 
     try:
-        session = stripe.checkout.Session.retrieve(session_id)
+        session = stripe.checkout.Session.retrieve(session_id, expand=['subscription.latest_invoice', 'invoice', 'customer'])
         # Stripe objects behave like dicts, but ensure robust access
         sub_id = session.get('subscription') if hasattr(session, 'get') else session['subscription'] if 'subscription' in session else None
+        subscription = None
+        if isinstance(sub_id, dict):
+            subscription = sub_id
+            sub_id = sub_id.get('id')
         cust_id = session.get('customer') if hasattr(session, 'get') else session['customer'] if 'customer' in session else None
         if not sub_id and not cust_id:
             raise HTTPException(status_code=400, detail="Invalid or incomplete session")
+        # concise info log
+        logger.info(f"Finalize checkout: session={session_id} sub_id={sub_id} status={session.get('status')} payment_status={session.get('payment_status')}")
 
         # Update tenant billing settings
         tenant_id = current_tenant['id'] if isinstance(current_tenant['id'], uuid.UUID) else uuid.UUID(str(current_tenant['id']))
@@ -686,6 +840,84 @@ async def finalize_stripe_checkout(
         billing['subscription_status'] = 'active'
         settings['billing'] = billing
         await TenantRepository.update_tenant(tenant_id, settings=settings, is_active=True)
+
+        # If Stripe already produced an invoice, persist and email it now
+        try:
+            inv_obj = None
+
+            async def _fetch_invoice() -> Optional[dict]:
+                loc_inv = None
+                # subscription may be expanded
+                if subscription and isinstance(subscription, dict):
+                    li = subscription.get('latest_invoice')
+                    if isinstance(li, dict):
+                        loc_inv = li
+                    elif li:
+                        loc_inv = stripe.Invoice.retrieve(li)
+                # fallback to session.invoice if present
+                if not loc_inv:
+                    inv_id = session.get('invoice') if hasattr(session, 'get') else None
+                    if inv_id:
+                        loc_inv = stripe.Invoice.retrieve(inv_id)
+                # if subscription is just an id, fetch expanded latest_invoice
+                if not loc_inv and sub_id and not subscription:
+                    try:
+                        sub_full = stripe.Subscription.retrieve(sub_id, expand=['latest_invoice'])
+                        li = sub_full.get('latest_invoice') if hasattr(sub_full, 'get') else None
+                        if isinstance(li, dict):
+                            loc_inv = li
+                        elif li:
+                            loc_inv = stripe.Invoice.retrieve(li)
+                    except Exception:
+                        pass
+                return loc_inv
+
+            # Poll briefly because Stripe may not have the invoice ready at finalize time
+            for _ in range(5):
+                inv_obj = await _fetch_invoice()
+                if inv_obj:
+                    break
+                await asyncio.sleep(1)
+
+            if inv_obj:
+                logger.info(f"Finalize checkout: found invoice {inv_obj.get('id')} status={inv_obj.get('status')}")
+                start_ts = inv_obj.get('period_start') or (inv_obj.get('lines', {}).get('data', [{}])[0].get('period', {}).get('start'))
+                end_ts = inv_obj.get('period_end') or (inv_obj.get('lines', {}).get('data', [{}])[0].get('period', {}).get('end'))
+                period_start = datetime.fromtimestamp(start_ts, tz=timezone.utc) if start_ts else None
+                period_end = datetime.fromtimestamp(end_ts, tz=timezone.utc) if end_ts else None
+                def _to_plain(obj: Any) -> Dict[str, Any]:
+                    try:
+                        if hasattr(obj, "to_dict_recursive"):
+                            return obj.to_dict_recursive()
+                        if hasattr(obj, "to_dict"):
+                            return obj.to_dict()
+                        if isinstance(obj, dict):
+                            return obj
+                        return dict(obj)
+                    except Exception:
+                        return {}
+                await BillingInvoiceRepository.create_invoice(
+                    tenant_id=tenant_id,
+                    provider='stripe',
+                    external_id=str(inv_obj.get('id')),
+                    period_start=period_start,
+                    period_end=period_end,
+                    amount_cents=int(inv_obj.get('amount_paid') or inv_obj.get('amount_due') or 0),
+                    status=inv_obj.get('status', 'paid'),
+                    currency=(inv_obj.get('currency') or 'usd').upper(),
+                    payload=_to_plain(inv_obj),
+                )
+                await _send_invoice_email(
+                    tenant_id=tenant_id,
+                    tenant_name=tenant.get('name'),
+                    invoice_obj=inv_obj,
+                    status_label="issued",
+                )
+            else:
+                logger.warning(f"Finalize checkout: no invoice found for session {session_id} (sub_id={sub_id}); email not sent")
+        except Exception as e:
+            logger.error(f"Finalize checkout: error while fetching invoice: {e}")
+
         return { 'finalized': True, 'subscription_id': sub_id, 'customer_id': cust_id }
     except HTTPException:
         raise
