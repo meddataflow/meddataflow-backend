@@ -7,8 +7,11 @@ Runs daily to delete hl7_messages and workflow_executions older than policy.
 import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+import logging
 
 from database.connection import fetch_all_dict, execute_dict
+
+logger = logging.getLogger(__name__)
 
 
 class RetentionService:
@@ -28,8 +31,11 @@ class RetentionService:
             self._task.cancel()
             try:
                 await self._task
-            except Exception:
+            except asyncio.CancelledError:
+                # Expected during shutdown; avoid noisy tracebacks
                 pass
+            except Exception as e:  # pragma: no cover - defensive shutdown path
+                logger.warning("Retention service stop error: %s", e)
             self._task = None
 
     async def _run_loop(self) -> None:
@@ -37,9 +43,14 @@ class RetentionService:
         while self._running:
             try:
                 await self._cleanup()
-            except Exception:
-                pass
-            await asyncio.sleep(24 * 60 * 60)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("Retention cleanup error: %s", e)
+            try:
+                await asyncio.sleep(24 * 60 * 60)
+            except asyncio.CancelledError:
+                break
 
     async def _cleanup(self) -> None:
         # Load tenants with a positive retention_days
@@ -72,4 +83,3 @@ class RetentionService:
 
 
 retention_service = RetentionService()
-
