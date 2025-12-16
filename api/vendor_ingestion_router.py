@@ -5,11 +5,22 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 import uuid
 import json
+import csv
 
 from database.connection import fetch_one, execute, fetch_all
 from services.hl7_parser import HL7Parser
 from services.queue_service import queue_service
 from models.tenant import TenantRepository
+from models.plan import PlanRepository
+from services.email_service import send_email
+from services.settings_service import settings_service
+try:
+    import stripe
+except Exception:
+    stripe = None
+
+logger = logging.getLogger(__name__)
+import os
 
 
 logger = logging.getLogger(__name__)
@@ -208,23 +219,100 @@ async def _ingest_vendor_message_internal(
         tenant = await TenantRepository.get_tenant_by_id(vendor_info['tenant_id'])
         if not isinstance(tenant, dict):
             tenant = {}
-        plan = (tenant.get('plan') or 'PROFESSIONAL').upper()
+        raw_settings = tenant.get('settings') or {}
+        if isinstance(raw_settings, str):
+            try:
+                raw_settings = json.loads(raw_settings)
+            except Exception:
+                raw_settings = {}
+        billing_settings = dict((raw_settings.get('billing') or {}) if isinstance(raw_settings, dict) else {})
+        plan_code = str(billing_settings.get('plan_code') or tenant.get('plan') or 'UNKNOWN').upper()
+
+        # Plan/subscription enforcement: require explicit included_messages in billing settings/plan
         from datetime import timezone
         start_month = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        # Usage this month
-        monthly_usage = await fetch_one("SELECT COUNT(*) AS c FROM hl7_messages WHERE tenant_id = $1 AND created_at >= $2", vendor_info['tenant_id'], start_month)
+        monthly_usage = await fetch_one(
+            "SELECT COUNT(*) AS c FROM hl7_messages WHERE tenant_id = $1 AND created_at >= $2",
+            vendor_info['tenant_id'],
+            start_month
+        )
         usage_count = monthly_usage['c'] if monthly_usage else 0
-        plan_included = {'FREE': 1000, 'PROFESSIONAL': 100000, 'ENTERPRISE': 2000000}.get(plan, 100000)
-        billing_settings = ((tenant.get('settings') or {}).get('billing') or {}) if isinstance(tenant.get('settings'), dict) else {}
+
+        incoming_count = 1
+        if message_format == 'csv':
+            try:
+                rows = list(csv.reader(raw_message.splitlines()))
+                rows = [r for r in rows if any((c or '').strip() for c in r)]
+                incoming_count = max(1, len(rows) - 1 if rows else 1)
+            except Exception:
+                incoming_count = 1
+
+        plan_included: Optional[int] = None
+        try:
+            if billing_settings.get("included_messages") is not None:
+                plan_included = int(billing_settings.get("included_messages"))
+        except Exception:
+            plan_included = None
+
+        if plan_included is None and plan_code and plan_code != 'UNKNOWN':
+            try:
+                plan_obj = await PlanRepository.get_plan_by_code(plan_code)
+                if plan_obj and plan_obj.get("included_messages") is not None:
+                    plan_included = int(plan_obj["included_messages"])
+            except Exception:
+                plan_included = None
+
+        if plan_included is None or plan_included <= 0:
+            logger.warning("[PLAN ENFORCEMENT] Missing included_messages for tenant=%s plan_code=%s billing=%s", tenant.get('id'), plan_code, billing_settings)
+            raise HTTPException(status_code=402, detail="Plan limits not configured. Please set included_messages in billing settings.")
+
+        if billing_settings.get("included_messages") != plan_included or billing_settings.get("plan_code") != plan_code:
+            billing_settings["included_messages"] = plan_included
+            billing_settings["plan_code"] = plan_code
+            raw_settings["billing"] = billing_settings
+            tid = tenant.get('id')
+            tid = tid if isinstance(tid, uuid.UUID) else uuid.UUID(str(tid))
+            try:
+                await TenantRepository.update_tenant(tid, settings=raw_settings)
+            except Exception:
+                pass
+
         billing_exempt = bool(billing_settings.get('billing_exempt', False))
-        # If no subscription status is present, treat as active to avoid blocking ingestion in non-billed environments
-        subscription_status = (billing_settings.get('subscription_status') or 'active').lower()
-        # Require subscription for paid plans unless exempt or trialing
-        if plan != 'FREE' and not billing_exempt and subscription_status not in ('active', 'trialing'):
-            raise HTTPException(status_code=402, detail="Subscription required for this tenant. Please subscribe or contact support.")
-        enforce_cap = bool(billing_settings.get('enforce_cap', False))
-        if enforce_cap and usage_count >= plan_included:
-            raise HTTPException(status_code=402, detail="Plan limit exceeded. Please upgrade or disable enforce_cap to continue.")
+        projected = usage_count + incoming_count
+        debug_info = {
+            "tenant_id": str(vendor_info['tenant_id']),
+            "plan_code": plan_code,
+            "included": plan_included,
+            "usage": usage_count,
+            "incoming": incoming_count,
+            "projected": projected,
+            "billing_exempt": billing_exempt,
+            "start_month": start_month.isoformat(),
+        }
+        logger.warning(f"[PLAN ENFORCEMENT] {debug_info}")
+        if not billing_exempt and projected > plan_included:
+            raise HTTPException(status_code=402, detail=f"Plan limit exceeded. Details: {debug_info}")
+        # Notify when nearing limit (80%) once per day
+        try:
+            threshold = float(billing_settings.get('notify_threshold', 0.8))
+            last_alert = billing_settings.get('last_usage_alert_at')
+            now_iso = datetime.now(timezone.utc).date().isoformat()
+            if plan_included and projected >= threshold * plan_included:
+                if str(last_alert or "") != now_iso:
+                    billing_email = tenant.get('billing_email')
+                    subj = f"Usage approaching plan limit for {tenant.get('name')}"
+                    body = (f"You have used {projected} of {plan_included} messages this period (including {incoming_count} incoming in this request).\n"
+                            f"Plan: {plan_code}\n"
+                            "We will enforce limits at the cap. Please upgrade if needed.")
+                    if billing_email:
+                        await send_email(billing_email, subj, body)
+                    billing_settings['last_usage_alert_at'] = now_iso
+                    raw_settings['billing'] = billing_settings
+                    tid = tenant.get('id')
+                    tid = tid if isinstance(tid, uuid.UUID) else uuid.UUID(str(tid))
+                    await TenantRepository.update_tenant(tid, settings=raw_settings)
+        except Exception:
+            pass
         
         # Validate message size
         message_size = len(raw_message.encode('utf-8'))
@@ -409,94 +497,137 @@ async def _process_non_hl7_message(
 ):
     """Handle ingestion for non-HL7 message formats."""
 
-    message_id = uuid.uuid4()
-    message_control_id = str(uuid.uuid4())
-    message_type = message_format.upper()
-    validation_errors: List[str] = []
+    messages_created: List[str] = []
 
-    metadata: Dict[str, Any] = {
-        "format": message_format,
-        "ingested_at": datetime.utcnow().isoformat()
-    }
+    if message_format == 'csv':
+        rows = list(csv.reader(raw_message.splitlines()))
+        rows = [r for r in rows if any((c or '').strip() for c in r)]
+        if not rows:
+            raise HTTPException(status_code=400, detail="CSV file contains no rows")
+        has_header = any(not (cell or "").strip().isdigit() for cell in rows[0]) and len(rows) > 1
+        data_rows = rows[1:] if has_header else rows
+        if not data_rows:
+            raise HTTPException(status_code=400, detail="CSV file contains no data rows")
+        for idx, row in enumerate(data_rows):
+            message_id = uuid.uuid4()
+            message_control_id = str(uuid.uuid4())
+            row_str = ",".join(row)
+            metadata: Dict[str, Any] = {
+                "format": message_format,
+                "ingested_at": datetime.utcnow().isoformat(),
+                "row_index": idx + (1 if has_header else 0),
+                "row_values": row,
+                "byte_size": len(row_str.encode('utf-8')),
+            }
+            await execute(
+                insert_query,
+                message_id,
+                vendor_info['tenant_id'],
+                vendor_info['vendor_endpoint_id'],
+                message_control_id,
+                "CSV",
+                None,
+                None,
+                row_str,
+                json.dumps({"format": message_format, "metadata": metadata}),
+                vendor_info.get('vendor_name', ''),
+                '',
+                vendor_info.get('tenant_slug', ''),
+                '',
+                'RECEIVED',
+                'INBOUND',
+                None,
+                f"vendor:{vendor_slug}",
+                datetime.utcnow()
+            )
+            messages_created.append(str(message_id))
+    else:
+        message_id = uuid.uuid4()
+        message_control_id = str(uuid.uuid4())
+        message_type = message_format.upper()
+        validation_errors: List[str] = []
 
-    try:
-        if message_format == 'fhir':
-            resource = json.loads(raw_message)
-            resource_type = resource.get('resourceType', 'Resource')
-            message_type = f"FHIR:{resource_type}"
-            message_control_id = resource.get('id', message_control_id)
-            metadata.update({
-                "resourceType": resource_type,
-                "id": resource.get('id'),
-                "meta": resource.get('meta')
-            })
-        elif message_format == 'x12':
-            metadata.update({
-                "segment_count": raw_message.count('~') + 1 if '~' in raw_message else 1
-            })
-        elif message_format == 'ncpdp':
-            metadata.update({
-                "field_delimiter": '|'
-            })
-        elif message_format in {'cda', 'ccd', 'ccr'}:
-            metadata.update({
-                "document_hint": message_format.upper()
-            })
-        elif message_format == 'terminology':
-            try:
-                sample = json.loads(raw_message)
+        metadata: Dict[str, Any] = {
+            "format": message_format,
+            "ingested_at": datetime.utcnow().isoformat()
+        }
+
+        try:
+            if message_format == 'fhir':
+                resource = json.loads(raw_message)
+                resource_type = resource.get('resourceType', 'Resource')
+                message_type = f"FHIR:{resource_type}"
+                message_control_id = resource.get('id', message_control_id)
                 metadata.update({
-                    "code": sample.get('code'),
-                    "system": sample.get('system'),
-                    "display": sample.get('display')
+                    "resourceType": resource_type,
+                    "id": resource.get('id'),
+                    "meta": resource.get('meta')
                 })
-            except json.JSONDecodeError:
+            elif message_format == 'x12':
                 metadata.update({
-                    "note": "Terminology payload stored as raw text"
+                    "segment_count": raw_message.count('~') + 1 if '~' in raw_message else 1
                 })
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid {message_format.upper()} payload: {str(exc)}")
+            elif message_format == 'ncpdp':
+                metadata.update({
+                    "field_delimiter": '|'
+                })
+            elif message_format in {'cda', 'ccd', 'ccr'}:
+                metadata.update({
+                    "document_hint": message_format.upper()
+                })
+            elif message_format == 'terminology':
+                try:
+                    sample = json.loads(raw_message)
+                    metadata.update({
+                        "code": sample.get('code'),
+                        "system": sample.get('system'),
+                        "display": sample.get('display')
+                    })
+                except json.JSONDecodeError:
+                    metadata.update({
+                        "note": "Terminology payload stored as raw text"
+                    })
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid {message_format.upper()} payload: {str(exc)}")
 
-    metadata["byte_size"] = len(raw_message.encode('utf-8'))
+        metadata["byte_size"] = len(raw_message.encode('utf-8'))
 
-    await execute(
-        insert_query,
-        message_id,
-        vendor_info['tenant_id'],
-        vendor_info['vendor_endpoint_id'],
-        message_control_id,
-        message_type,
-        None,
-        None,
-        raw_message,
-        json.dumps({"format": message_format, "metadata": metadata}),
-        vendor_info.get('vendor_name', ''),
-        '',
-        vendor_info.get('tenant_slug', ''),
-        '',
-        'RECEIVED',
-        'INBOUND',
-        None,
-        f"vendor:{vendor_slug}",
-        datetime.utcnow()
-    )
+        await execute(
+            insert_query,
+            message_id,
+            vendor_info['tenant_id'],
+            vendor_info['vendor_endpoint_id'],
+            message_control_id,
+            message_type,
+            None,
+            None,
+            raw_message,
+            json.dumps({"format": message_format, "metadata": metadata}),
+            vendor_info.get('vendor_name', ''),
+            '',
+            vendor_info.get('tenant_slug', ''),
+            '',
+            'RECEIVED',
+            'INBOUND',
+            None,
+            f"vendor:{vendor_slug}",
+            datetime.utcnow()
+        )
+        messages_created.append(str(message_id))
 
     stats_update_query = """
     UPDATE vendor_endpoints 
-    SET total_messages_received = total_messages_received + 1,
-        updated_at = $2
+    SET total_messages_received = total_messages_received + $2,
+        updated_at = $3
     WHERE id = $1
     """
-    await execute(stats_update_query, vendor_info['vendor_endpoint_id'], datetime.utcnow())
+    await execute(stats_update_query, vendor_info['vendor_endpoint_id'], len(messages_created), datetime.utcnow())
 
     response_data = {
         "status": "success",
         "message": f"{message_format.upper()} message received",
-        "message_id": str(message_id),
-        "message_control_id": message_control_id,
-        "message_type": message_type,
-        "validation_errors": validation_errors,
-        "is_valid": len(validation_errors) == 0,
+        "message_ids": messages_created,
+        "message_type": message_format.upper(),
         "received_at": datetime.utcnow().isoformat(),
         "vendor_info": {
             "vendor_slug": vendor_info['vendor_slug'],
@@ -508,16 +639,19 @@ async def _process_non_hl7_message(
 
     if vendor_info['trigger_workflow_id']:
         try:
-            task_id = await queue_service.enqueue_workflow_execution(
-                workflow_id=vendor_info['trigger_workflow_id'],
-                message_id=str(message_id),
-                raw_message=raw_message,
-                vendor_info=vendor_info,
-                priority=3
-            )
+            task_ids = []
+            for mid in messages_created:
+                task_id = await queue_service.enqueue_workflow_execution(
+                    workflow_id=vendor_info['trigger_workflow_id'],
+                    message_id=mid,
+                    raw_message=raw_message,
+                    vendor_info=vendor_info,
+                    priority=3
+                )
+                task_ids.append(task_id)
             response_data["workflow_triggered"] = True
             response_data["workflow_id"] = vendor_info['trigger_workflow_id']
-            response_data["task_id"] = task_id
+            response_data["task_ids"] = task_ids
         except Exception as exc:
             logger.error(f"Failed to enqueue workflow execution for non-HL7 message: {exc}")
             response_data["workflow_triggered"] = False

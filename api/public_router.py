@@ -11,6 +11,7 @@ from models.tenant import TenantRepository
 from models.user import UserRepository, UserRole
 from services.email_service import send_email
 from services.auth_service import AuthService
+from services.settings_service import settings_service
 
 router = APIRouter(prefix="/api/public", tags=["public"])
 
@@ -212,10 +213,10 @@ async def provision(body: Dict[str, Any]):
             subj = f"Tenant awaiting approval: {name}"
             body_txt = f"Tenant '{name}' (slug: {slug}) requested activation without payment.\n\nLogin to Admin > Approvals to review."
             for addr in supers:
-                send_email(addr, subj, body_txt)
+                await send_email(addr, subj, body_txt)
 
             # Send confirmation to admin user
-            send_email(
+            await send_email(
                 admin_email,
                 "Your tenant activation request is pending",
                 f"Thank you for registering '{name}'.\n\nYour request is pending approval from our team. You will receive an email when your account is activated.",
@@ -224,7 +225,7 @@ async def provision(body: Dict[str, Any]):
 
             # Also send to billing email if provided and different
             if tenant.get('billing_email') and tenant.get('billing_email') != admin_email:
-                send_email(tenant['billing_email'], "Your activation request is pending", "We received your request. A MedDataFlow admin will review and activate your tenant.")
+                await send_email(tenant['billing_email'], "Your activation request is pending", "We received your request. A MedDataFlow admin will review and activate your tenant.")
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning(f"Failed to send approval notification emails: {e}")
@@ -247,28 +248,10 @@ async def provision(body: Dict[str, Any]):
         raise HTTPException(status_code=400, detail="Invalid activation mode")
 
 
-# Public platform branding (no auth)
-BRANDING_PATH = Path(__file__).resolve().parent.parent / "config" / "branding.json"
-
-def _read_platform_branding() -> Dict[str, Any]:
-    try:
-        if BRANDING_PATH.exists():
-            data = json.loads(BRANDING_PATH.read_text())
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        pass
-    return {
-        "app_name": "meddataflow",
-        "company_logo_url": None,
-        "favicon_url": None,
-        "idle_timeout_minutes": 5,
-        "idle_warning_seconds": 60,
-    }
-
 @router.get("/platform-branding")
 async def public_platform_branding() -> Dict[str, Any]:
     """Publicly readable branding for unauthenticated pages (login, landing)."""
-    return _read_platform_branding()
+    return await settings_service.get_platform_branding()
 
 
 @router.post("/contact")
@@ -295,7 +278,7 @@ async def contact_us(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         # Destination inbox
         to_addr = "info@meddataflow.com"
-        sent = send_email(to_addr, subject, body)
+        sent = await send_email(to_addr, subject, body)
 
         return {"ok": True, "sent": sent}
     except HTTPException:

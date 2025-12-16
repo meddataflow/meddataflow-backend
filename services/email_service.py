@@ -1,6 +1,6 @@
 """
 Lightweight email service using SMTP if configured; otherwise logs to stdout.
-Sources configuration from environment first, then platform_config.json set by super admins.
+Sources configuration from environment first, then system_settings (platform_config) set by super admins.
 Env vars:
 - SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_FROM, SMTP_TLS ("true"/"false")
 """
@@ -9,11 +9,16 @@ import smtplib
 from email.message import EmailMessage
 import logging
 import json
+import asyncio
 from pathlib import Path
+
+from services.settings_service import settings_service
 
 logger = logging.getLogger(__name__)
 
-def _load_platform_email_config() -> dict:
+
+async def _load_legacy_email_config() -> dict:
+    """Read legacy file-based config for migration."""
     try:
         cfg_path = Path(__file__).resolve().parent.parent / "config" / "platform_config.json"
         if cfg_path.exists():
@@ -23,9 +28,27 @@ def _load_platform_email_config() -> dict:
         return {}
     return {}
 
-def _resolve_email_settings() -> dict:
+
+async def _load_platform_email_config() -> dict:
+    """Load email config from DB (with legacy file fallback)."""
+    try:
+        cfg = await settings_service.get_platform_config()
+        email_cfg = cfg.get("email") or {}
+        if email_cfg:
+            return email_cfg
+        # Migrate legacy file if DB empty
+        legacy = await _load_legacy_email_config()
+        if legacy:
+            cfg["email"] = legacy
+            await settings_service.set_platform_config(cfg)
+        return legacy
+    except Exception:
+        return {}
+
+
+async def _resolve_email_settings() -> dict:
     # Load platform config then override with any env vars provided
-    cfg = _load_platform_email_config()
+    cfg = await _load_platform_email_config()
     env_cfg = {
         "smtp_host": os.getenv("SMTP_HOST"),
         "smtp_port": os.getenv("SMTP_PORT"),
@@ -39,8 +62,9 @@ def _resolve_email_settings() -> dict:
             cfg[key] = val
     return cfg
 
-def send_email(to: str, subject: str, body: str, html: str | None = None, attachments: list[dict] | None = None) -> bool:
-    cfg = _resolve_email_settings()
+
+async def send_email(to: str, subject: str, body: str, html: str | None = None, attachments: list[dict] | None = None) -> bool:
+    cfg = await _resolve_email_settings()
     host = cfg.get('smtp_host')
     port_val = cfg.get('smtp_port')
     try:
@@ -76,14 +100,19 @@ def send_email(to: str, subject: str, body: str, html: str | None = None, attach
         logger.warning("SMTP not configured; skipping email send (missing host/user/pwd)")
         return False
 
-    try:
-        server = smtplib.SMTP(host, port)
-        if use_tls:
-            server.starttls()
-        server.login(user, pwd)
-        server.send_message(msg)
-        server.quit()
-        return True
-    except Exception as e:
-        logger.error(f"Failed to send email to {to}: {e}")
-        return False
+    def _send_sync() -> bool:
+        try:
+            server = smtplib.SMTP(host, port)
+            if use_tls:
+                server.starttls()
+            server.login(user, pwd)
+            server.send_message(msg)
+            server.quit()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send email to {to}: {e}")
+            return False
+
+    # Run blocking SMTP in thread executor to avoid blocking event loop
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _send_sync)

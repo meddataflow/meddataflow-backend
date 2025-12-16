@@ -28,8 +28,18 @@ class PlanRepository:
 
     @staticmethod
     async def get_plan_by_code(code: str) -> Optional[Dict[str, Any]]:
-        query = "SELECT * FROM subscription_plans WHERE code = $1"
+        query = "SELECT * FROM subscription_plans WHERE LOWER(code) = LOWER($1)"
         return await fetch_one(query, code)
+
+    @staticmethod
+    async def get_plan_by_price_id(price_id: str) -> Optional[Dict[str, Any]]:
+        query = "SELECT * FROM subscription_plans WHERE stripe_price_id = $1"
+        return await fetch_one(query, price_id)
+
+    @staticmethod
+    async def get_plan_by_id(plan_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+        query = "SELECT * FROM subscription_plans WHERE id = $1"
+        return await fetch_one(query, plan_id)
 
     @staticmethod
     async def update_plan(plan_id: uuid.UUID, **updates) -> Optional[Dict[str, Any]]:

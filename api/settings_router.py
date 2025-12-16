@@ -2,15 +2,18 @@
 Settings router: user and tenant settings management
 """
 from typing import Optional, Dict, Any, List
-from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File, Response
+from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File
 from pydantic import BaseModel, EmailStr
 import uuid
+import os
 from pathlib import Path
 import json
+import base64
 
 from api.auth_deps import get_current_user, get_current_tenant, require_tenant_admin, require_super_admin
 from models.user import UserRepository
 from models.tenant import TenantRepository
+from services.settings_service import settings_service
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -142,6 +145,7 @@ async def get_tenant_settings(
             raw_settings = json.loads(raw_settings)
         except Exception:
             raw_settings = {}
+    await _restore_tenant_logo_file(tenant["id"] if isinstance(tenant["id"], uuid.UUID) else uuid.UUID(str(tenant["id"])), raw_settings)
     return {
         "id": str(tenant["id"]),
         "name": tenant["name"],
@@ -228,33 +232,6 @@ async def regenerate_tenant_api_key(
     return {"api_key": updated.get("api_key"), "id": str(updated["id"]) }
 
 
-# ----------------------
-# Platform branding file
-# ----------------------
-BRANDING_PATH = Path(__file__).resolve().parent.parent / "config" / "branding.json"
-PLATFORM_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "platform_config.json"
-
-def _read_platform_branding() -> Dict[str, Any]:
-    try:
-        if BRANDING_PATH.exists():
-            data = json.loads(BRANDING_PATH.read_text())
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        pass
-    # defaults
-    return {
-        "app_name": "meddataflow",
-        "company_logo_url": None,
-        "favicon_url": None,
-        "idle_timeout_minutes": 5,
-        "idle_warning_seconds": 60,
-    }
-
-def _write_platform_branding(data: Dict[str, Any]) -> None:
-    BRANDING_PATH.parent.mkdir(parents=True, exist_ok=True)
-    BRANDING_PATH.write_text(json.dumps(data, indent=2))
-
-
 @router.get('/mllp')
 async def get_mllp_settings(current_user: Dict[str, Any] = Depends(require_super_admin())):
     """Get global MLLP listener configuration (super admin)."""
@@ -295,11 +272,11 @@ async def update_mllp_settings(payload: MLLPConfig, current_user: Dict[str, Any]
 
 @router.get("/platform-branding")
 async def get_platform_branding(_: Dict[str, Any] = Depends(get_current_user)):
-    return _read_platform_branding()
+    return await settings_service.get_platform_branding()
 
 @router.patch("/platform-branding")
 async def update_platform_branding(payload: PlatformBranding, __: Dict[str, Any] = Depends(require_super_admin())):
-    current = _read_platform_branding()
+    current = await settings_service.get_platform_branding()
     for f in ["app_name", "company_logo_url", "favicon_url", "idle_timeout_minutes", "idle_warning_seconds"]:
         v = getattr(payload, f)
         if v is not None:
@@ -316,7 +293,7 @@ async def update_platform_branding(payload: PlatformBranding, __: Dict[str, Any]
                     continue
             else:
                 current[f] = v
-    _write_platform_branding(current)
+    await settings_service.set_platform_branding(current)
     return current
 
 
@@ -339,22 +316,9 @@ class Coupon(BaseModel):
     amount_off_cents: Optional[int] = None
     stripe_coupon_id: Optional[str] = None
 
-def _read_platform_config() -> Dict[str, Any]:
-    try:
-        if PLATFORM_CONFIG_PATH.exists():
-            data = json.loads(PLATFORM_CONFIG_PATH.read_text())
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        pass
-    return {}
-
-def _write_platform_config(data: Dict[str, Any]) -> None:
-    PLATFORM_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PLATFORM_CONFIG_PATH.write_text(json.dumps(data, indent=2))
-
 @router.get("/platform-billing")
 async def get_platform_billing(_: Dict[str, Any] = Depends(require_super_admin())):
-    cfg = _read_platform_config()
+    cfg = await settings_service.get_platform_config()
     stripe_cfg = cfg.get('stripe') or {}
     return {
         'stripe_publishable_key': stripe_cfg.get('publishable_key'),
@@ -365,7 +329,7 @@ async def get_platform_billing(_: Dict[str, Any] = Depends(require_super_admin()
 
 @router.patch("/platform-billing")
 async def update_platform_billing(payload: PlatformBilling, __: Dict[str, Any] = Depends(require_super_admin())):
-    cfg = _read_platform_config()
+    cfg = await settings_service.get_platform_config()
     stripe_cfg = dict(cfg.get('stripe') or {})
     if payload.stripe_publishable_key is not None:
         stripe_cfg['publishable_key'] = payload.stripe_publishable_key
@@ -374,12 +338,12 @@ async def update_platform_billing(payload: PlatformBilling, __: Dict[str, Any] =
     if payload.stripe_webhook_secret is not None:
         stripe_cfg['webhook_secret'] = payload.stripe_webhook_secret
     cfg['stripe'] = stripe_cfg
-    _write_platform_config(cfg)
+    await settings_service.set_platform_config(cfg)
     return {'updated': True, 'stripe': stripe_cfg}
 
 @router.get("/platform-email")
 async def get_platform_email(_: Dict[str, Any] = Depends(require_super_admin())):
-    cfg = _read_platform_config()
+    cfg = await settings_service.get_platform_config()
     email_cfg = cfg.get('email') or {}
     return {
         "smtp_host": email_cfg.get("smtp_host"),
@@ -393,7 +357,7 @@ async def get_platform_email(_: Dict[str, Any] = Depends(require_super_admin()))
 
 @router.patch("/platform-email")
 async def update_platform_email(payload: PlatformEmail, __: Dict[str, Any] = Depends(require_super_admin())):
-    cfg = _read_platform_config()
+    cfg = await settings_service.get_platform_config()
     email_cfg = dict(cfg.get('email') or {})
     if payload.smtp_host is not None:
         email_cfg['smtp_host'] = payload.smtp_host
@@ -408,7 +372,7 @@ async def update_platform_email(payload: PlatformEmail, __: Dict[str, Any] = Dep
     if payload.smtp_tls is not None:
         email_cfg['smtp_tls'] = payload.smtp_tls
     cfg['email'] = email_cfg
-    _write_platform_config(cfg)
+    await settings_service.set_platform_config(cfg)
     return {"updated": True, "email": {k: v for k, v in email_cfg.items() if k != "smtp_password"}}
 
 class EmailTest(BaseModel):
@@ -419,21 +383,21 @@ class EmailTest(BaseModel):
 @router.post("/platform-email/test")
 async def test_platform_email(payload: EmailTest, __: Dict[str, Any] = Depends(require_super_admin())):
     from services.email_service import send_email
-    ok = send_email(payload.to, payload.subject or "Test email", payload.body or "Test")
+    ok = await send_email(payload.to, payload.subject or "Test email", payload.body or "Test")
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to send test email. Check SMTP settings.")
     return {"sent": True}
 
 @router.get("/platform-coupons")
 async def list_platform_coupons(_: Dict[str, Any] = Depends(require_super_admin())):
-    cfg = _read_platform_config()
+    cfg = await settings_service.get_platform_config()
     return {"coupons": cfg.get("coupons", [])}
 
 @router.patch("/platform-coupons")
 async def update_platform_coupons(coupons: List[Coupon], __: Dict[str, Any] = Depends(require_super_admin())):
-    cfg = _read_platform_config()
+    cfg = await settings_service.get_platform_config()
     cfg["coupons"] = [c.model_dump() for c in coupons]
-    _write_platform_config(cfg)
+    await settings_service.set_platform_config(cfg)
     return {"updated": True, "coupons": cfg["coupons"]}
 
 # ----------------------
@@ -448,6 +412,28 @@ def _safe_ext(filename: str) -> str:
     if ext.lower() in [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico"]:
         return ext
     return ".png"
+
+async def _restore_tenant_logo_file(tenant_id: uuid.UUID, settings: Dict[str, Any]) -> None:
+    """If a tenant logo blob exists in settings, ensure the file is present on disk."""
+    try:
+        branding = settings.get("branding") or {}
+        blob = branding.get("tenant_logo_blob")
+        url = branding.get("tenant_logo_url")
+        if not blob or not url or not str(url).startswith("/static/"):
+            return
+        rel = url.lstrip("/")
+        out_path = STATIC_DIR / Path(rel).relative_to("static")
+        if out_path.exists():
+            return
+        data_b64 = blob.get("base64_data")
+        if not data_b64:
+            return
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        content = base64.b64decode(data_b64)
+        out_path.write_bytes(content)
+    except Exception:
+        # Best-effort restore; ignore failures
+        return
 
 @router.post("/tenant/logo")
 async def upload_tenant_logo(
@@ -470,8 +456,11 @@ async def upload_tenant_logo(
     fname = f"logo{ext}"
     out_path = tenant_dir / fname
     content = await file.read()
-    out_path.write_bytes(content)
     url = f"/static/uploads/tenants/{target_tenant_id}/{fname}"
+    try:
+        out_path.write_bytes(content)
+    except PermissionError:
+        url = f"data:{file.content_type or 'image/png'};base64,{base64.b64encode(content).decode('ascii')}"
 
     # Update tenant settings.branding.tenant_logo_url
     tenant = await TenantRepository.get_tenant_by_id(target_tenant_id)
@@ -484,6 +473,10 @@ async def upload_tenant_logo(
     current_settings = dict(current_settings)
     branding = dict(current_settings.get("branding") or {})
     branding["tenant_logo_url"] = url
+    branding["tenant_logo_blob"] = {
+        "mime_type": file.content_type or "application/octet-stream",
+        "base64_data": base64.b64encode(content).decode("ascii"),
+    }
     current_settings["branding"] = branding
     await TenantRepository.update_tenant(target_tenant_id, settings=current_settings)
     return {"url": url}
@@ -500,11 +493,13 @@ async def upload_platform_logo(
     fname = f"company-logo{ext}"
     out_path = plat_dir / fname
     content = await file.read()
-    out_path.write_bytes(content)
     url = f"/static/uploads/platform/{fname}"
-    data = _read_platform_branding()
-    data["company_logo_url"] = url
-    _write_platform_branding(data)
+    try:
+        out_path.write_bytes(content)
+    except PermissionError:
+        # Fallback to data URL if filesystem not writable
+        url = f"data:{file.content_type or 'image/png'};base64,{base64.b64encode(content).decode('ascii')}"
+    await settings_service.store_platform_asset("company_logo", url, content, file.content_type)
     return {"url": url}
 
 
@@ -519,9 +514,10 @@ async def upload_platform_favicon(
     fname = f"favicon{ext}"
     out_path = plat_dir / fname
     content = await file.read()
-    out_path.write_bytes(content)
     url = f"/static/uploads/platform/{fname}"
-    data = _read_platform_branding()
-    data["favicon_url"] = url
-    _write_platform_branding(data)
+    try:
+        out_path.write_bytes(content)
+    except PermissionError:
+        url = f"data:{file.content_type or 'image/x-icon'};base64,{base64.b64encode(content).decode('ascii')}"
+    await settings_service.store_platform_asset("favicon", url, content, file.content_type)
     return {"url": url}

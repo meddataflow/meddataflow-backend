@@ -1,10 +1,12 @@
 """
 Settings Service - Manage application settings including AI configuration
 """
+import base64
 import json
 import logging
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from database.connection import fetch_one, execute_returning, execute
 
 logger = logging.getLogger(__name__)
@@ -12,6 +14,8 @@ logger = logging.getLogger(__name__)
 
 class SettingsService:
     """Service for managing application settings"""
+    _legacy_config_dir = Path(__file__).resolve().parent.parent / "config"
+    _static_dir = Path(__file__).resolve().parent.parent / "static"
 
     async def get_ai_settings(self) -> Dict[str, Any]:
         """Get AI-related settings"""
@@ -298,6 +302,117 @@ class SettingsService:
 
         except Exception as e:
             logger.error(f"Error ensuring settings tables: {e}")
+
+    async def _read_legacy_file(self, filename: str) -> Optional[Dict[str, Any]]:
+        """Load legacy JSON config from disk (used for one-time migration)."""
+        try:
+            path = self._legacy_config_dir / filename
+            if path.exists():
+                data = json.loads(path.read_text())
+                return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+        return None
+
+    async def get_platform_branding(self) -> Dict[str, Any]:
+        """Return platform branding, migrating from legacy file storage if needed."""
+        default = {
+            "app_name": "meddataflow",
+            "company_logo_url": None,
+            "favicon_url": None,
+            "idle_timeout_minutes": 5,
+            "idle_warning_seconds": 60,
+        }
+        try:
+            data = await self.get_system_setting("platform_branding", None)
+            if not isinstance(data, dict):
+                # Try legacy file as a migration path
+                legacy = await self._read_legacy_file("branding.json")
+                data = legacy if isinstance(legacy, dict) else {}
+                if data:
+                    await self.set_system_setting("platform_branding", data)
+            merged = {**default, **(data or {})}
+            await self._restore_branding_files(merged)
+            return merged
+        except Exception as e:
+            logger.error(f"Error getting platform branding: {e}")
+            return default
+
+    async def set_platform_branding(self, updates: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist platform branding settings."""
+        current = await self.get_platform_branding()
+        merged = {**current, **updates}
+        await self.set_system_setting("platform_branding", merged)
+        return merged
+
+    async def get_platform_config(self) -> Dict[str, Any]:
+        """Return platform config (billing/email/coupons), migrating from legacy file if present."""
+        try:
+            data = await self.get_system_setting("platform_config", None)
+            if not isinstance(data, dict):
+                legacy = await self._read_legacy_file("platform_config.json")
+                data = legacy if isinstance(legacy, dict) else {}
+                if data:
+                    await self.set_system_setting("platform_config", data)
+            return data or {}
+        except Exception as e:
+            logger.error(f"Error getting platform config: {e}")
+            return {}
+
+    async def set_platform_config(self, updates: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist platform config (billing/email/coupons)."""
+        current = await self.get_platform_config()
+        merged = {**current, **updates}
+        await self.set_system_setting("platform_config", merged)
+        return merged
+
+    async def _restore_branding_files(self, branding: Dict[str, Any]) -> None:
+        """Ensure logo/favicon files exist on disk using stored blobs, if present."""
+        try:
+            assets = branding.get("asset_blobs") or {}
+            tasks = [
+                ("company_logo_url", assets.get("company_logo")),
+                ("favicon_url", assets.get("favicon")),
+            ]
+            for url_key, blob in tasks:
+                url = branding.get(url_key)
+                if not url or not blob:
+                    continue
+                if not str(url).startswith("/static/"):
+                    continue
+                # Resolve target path within static dir
+                rel = url.lstrip("/")
+                out_path = self._static_dir / Path(rel).relative_to("static")
+                if out_path.exists():
+                    continue
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                data_b64 = blob.get("base64_data")
+                if not data_b64:
+                    continue
+                try:
+                    content = base64.b64decode(data_b64)
+                    out_path.write_bytes(content)
+                except PermissionError:
+                    # Cannot write to disk; leave as data-only
+                    continue
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning(f"Failed to restore branding files: {e}")
+
+    async def store_platform_asset(self, key: str, url: str, content: bytes, mime_type: Optional[str]) -> Dict[str, Any]:
+        """Persist platform asset blobs inside branding for durability."""
+        branding = await self.get_platform_branding()
+        assets = branding.get("asset_blobs") or {}
+        assets[key] = {
+            "mime_type": mime_type or "application/octet-stream",
+            "base64_data": base64.b64encode(content).decode("ascii")
+        }
+        branding["asset_blobs"] = assets
+        branding_key = "company_logo" if key == "company_logo" else "favicon" if key == "favicon" else key
+        branding[f"{branding_key}_url"] = url
+        await self.set_platform_branding(branding)
+        return branding
 
 
 # Global settings service instance

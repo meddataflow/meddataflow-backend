@@ -10,8 +10,17 @@ from fastapi import APIRouter, Depends, Query
 from api.auth_deps import require_super_admin
 from models.tenant import TenantRepository
 from models.hl7_message import HL7MessageRepository
+from models.billing import BillingInvoiceRepository
 from fastapi.responses import Response
 from datetime import timedelta
+import os
+import json as _json
+
+try:
+    import stripe
+except Exception:
+    stripe = None
+from services.settings_service import settings_service
 
 router = APIRouter(prefix="/api/admin/billing", tags=["admin-billing"])
 
@@ -121,3 +130,62 @@ async def admin_invoices_csv(
             f"{item['period_start']},{item['period_end']},{item['message_count']},{est['plan']},{est['base']},{est['included']},{est['overage_rate']},{est['overage_charges']},{est['estimated_total']}"
         )
     return Response("\n".join(rows), media_type="text/csv")
+
+
+@router.get("/invoice-latest")
+async def admin_latest_invoice_url(
+    _: Dict[str, Any] = Depends(require_super_admin()),
+    tenant_id: str = Query(...),
+):
+    """Return the latest invoice PDF/hosted URL for a tenant, preferring stored data then Stripe."""
+    tid = uuid.UUID(tenant_id)
+    tenant = await TenantRepository.get_tenant_by_id_any_status(tid)
+    if not tenant:
+        return Response(status_code=404)
+
+    # First, try stored invoices
+    latest = await BillingInvoiceRepository.get_latest_invoice(tid)
+    if latest:
+        try:
+            payload = latest.get("payload")
+            if isinstance(payload, str):
+                payload = _json.loads(payload)
+            if isinstance(payload, dict):
+                url = payload.get("invoice_pdf") or payload.get("hosted_invoice_url")
+                if url:
+                    return {"invoice_id": latest.get("external_id"), "url": url}
+        except Exception:
+            pass
+
+    # Next, try Stripe direct lookup if configured
+    cfg = await settings_service.get_platform_config()
+    stripe_cfg = cfg.get("stripe") or {}
+    secret = stripe_cfg.get("secret_key") or os.getenv("STRIPE_SECRET_KEY")
+    if not secret or stripe is None:
+        return Response(status_code=404)
+
+    billing = {}
+    settings = tenant.get("settings") or {}
+    if isinstance(settings, str):
+        try:
+            settings = _json.loads(settings)
+        except Exception:
+            settings = {}
+    billing = settings.get("billing") or {}
+    customer_id = billing.get("customer_id")
+    if not customer_id:
+        return Response(status_code=404)
+
+    try:
+        stripe.api_key = secret
+        invoices = stripe.Invoice.list(customer=customer_id, limit=1)
+        data = getattr(invoices, "data", None) or []
+        inv = data[0] if data else None
+        if not inv:
+            return Response(status_code=404)
+        url = inv.get("invoice_pdf") or inv.get("hosted_invoice_url")
+        if not url:
+            return Response(status_code=404)
+        return {"invoice_id": inv.get("id"), "url": url}
+    except Exception:
+        return Response(status_code=404)

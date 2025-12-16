@@ -13,21 +13,7 @@ try:
     import stripe
 except Exception:
     stripe = None
-from api.settings_router import Path as _Path  # placeholder; we'll use local reader
-import json
-
-from pathlib import Path as FsPath
-
-CONFIG_PATH = FsPath(__file__).resolve().parent.parent / "config" / "platform_config.json"
-
-def _read_platform_config() -> Dict[str, Any]:
-    try:
-        if CONFIG_PATH.exists():
-            data = json.loads(CONFIG_PATH.read_text())
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        pass
-    return {}
+from services.settings_service import settings_service
 
 router = APIRouter(prefix="/api", tags=["plans"])
 
@@ -85,7 +71,7 @@ async def create_plan_admin(body: PlanCreate):
     )
     # If no explicit price provided and Stripe configured, create Product+Price
     if (not plan.get('stripe_price_id')) and (body.create_stripe is not False):
-        cfg = _read_platform_config().get('stripe', {})
+        cfg = (await settings_service.get_platform_config()).get('stripe', {})
         secret = cfg.get('secret_key') or os.getenv('STRIPE_SECRET_KEY')
         if not secret:
             # no stripe configured; return plan as-is
@@ -114,10 +100,23 @@ async def update_plan_admin(plan_id: str, body: PlanUpdate):
         pid = uuid.UUID(plan_id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid plan id")
-    updated = await PlanRepository.update_plan(pid, **{k: v for k, v in body.dict(exclude_unset=True).items()})
-    if not updated:
-        raise HTTPException(status_code=404, detail="Plan not found or no changes")
-    return updated
+    existing = await PlanRepository.get_plan_by_id(pid) if hasattr(PlanRepository, "get_plan_by_id") else None
+    if existing is None:
+        # Fallback: try code lookup if id fetch not available
+        try:
+            from database.connection import fetch_one
+            row = await fetch_one("SELECT * FROM subscription_plans WHERE id = $1", pid)
+            existing = row
+        except Exception:
+            existing = None
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    updates = {k: v for k, v in body.dict(exclude_unset=True).items()}
+    try:
+        updated = await PlanRepository.update_plan(pid, **updates) if updates else existing
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to update plan: {e}")
+    return updated or existing
 
 
 @router.delete("/admin/plans/{plan_id}", dependencies=[Depends(require_super_admin())])

@@ -9,11 +9,11 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from api.auth_deps import get_current_user, get_current_tenant, require_tenant_admin, get_current_tenant_allow_inactive
-from api.settings_router import _read_platform_config
 from models.tenant import TenantRepository
 from models.hl7_message import HL7MessageRepository
 from models.billing import BillingInvoiceRepository
 from models.user import UserRepository
+from models.plan import PlanRepository
 import os
 import hmac
 import hashlib
@@ -21,6 +21,7 @@ from fastapi import Request
 from pathlib import Path
 import json as _json
 from services.email_service import send_email
+from services.settings_service import settings_service
 try:
     import stripe
 except Exception:
@@ -55,17 +56,82 @@ def _estimate(plan: str, monthly_messages: int) -> Dict[str, Any]:
         "estimated_total": round(total, 2),
     }
 
-def _resolve_coupon(code: Optional[str]) -> Optional[Dict[str, Any]]:
+
+async def _plan_included_messages(plan_code: str) -> int:
+    """Resolve included messages for a plan code with sensible defaults."""
+    included = 0
+    try:
+        plan = await PlanRepository.get_plan_by_code(plan_code)
+        if plan and plan.get("included_messages") is not None:
+            included = int(plan.get("included_messages") or 0)
+    except Exception:
+        included = 0
+    if included <= 0:
+        included = {'FREE': 1000, 'PROFESSIONAL': 100000, 'ENTERPRISE': 2000000}.get(plan_code, 100000)
+    return included
+
+
+async def _resolve_plan_from_stripe(billing: Dict[str, Any]) -> Optional[str]:
+    """Attempt to map stripe subscription to a plan code via price_id."""
+    cfg = await settings_service.get_platform_config()
+    stripe_cfg = cfg.get("stripe") or {}
+    secret = stripe_cfg.get("secret_key") or os.getenv("STRIPE_SECRET_KEY")
+    sub_id = billing.get("subscription_id")
+    if not secret or not sub_id or stripe is None:
+        return None
+    try:
+        stripe.api_key = secret
+        sub = stripe.Subscription.retrieve(sub_id, expand=["items.data.price"])
+        items = sub.get("items", {}).get("data") or []
+        price_id = None
+        if items:
+            price = items[0].get("price") or {}
+            price_id = price.get("id")
+        if not price_id:
+            return None
+        plan = await PlanRepository.get_plan_by_price_id(price_id)
+        if plan:
+            return plan.get("code")
+    except Exception:
+        return None
+    return None
+
+
+async def _plan_override(billing: Dict[str, Any], tenant: Dict[str, Any]) -> Dict[str, Any]:
+    """Return plan_code and included_messages derived from billing settings / Stripe / tenant."""
+    plan_code = (billing.get("plan_code") or tenant.get("plan") or "PROFESSIONAL").upper()
+    included_messages = billing.get("included_messages")
+    if included_messages is None:
+        try:
+            included_messages = int(billing.get("included_messages_override"))
+        except Exception:
+            included_messages = None
+
+    if not billing.get("plan_code"):
+        mapped = await _resolve_plan_from_stripe(billing)
+        if mapped:
+            plan_code = mapped.upper()
+            billing["plan_code"] = mapped
+    if included_messages is None and billing.get("plan_code"):
+        try:
+            plan_obj = await PlanRepository.get_plan_by_code(billing["plan_code"])
+            if plan_obj and plan_obj.get("included_messages") is not None:
+                included_messages = int(plan_obj.get("included_messages") or 0)
+        except Exception:
+            included_messages = None
+    if included_messages is None:
+        included_messages = await _plan_included_messages(plan_code)
+    return {"plan_code": plan_code, "included_messages": included_messages}
+
+async def _resolve_coupon(code: Optional[str]) -> Optional[Dict[str, Any]]:
     if not code:
         return None
     try:
-        cfg_path = Path(__file__).resolve().parent.parent / 'config' / 'platform_config.json'
-        if cfg_path.exists():
-            cfg = _json.loads(cfg_path.read_text())
-            coupons = cfg.get("coupons") or []
-            for c in coupons:
-                if str(c.get("code", "")).lower() == str(code).lower():
-                    return c
+        cfg = await settings_service.get_platform_config()
+        coupons = cfg.get("coupons") or []
+        for c in coupons:
+            if str(c.get("code", "")).lower() == str(code).lower():
+                return c
     except Exception:
         return None
     return None
@@ -188,7 +254,7 @@ async def _send_invoice_email(
             logger.warning("Failed to download invoice PDF for attachment")
 
     for addr in to_addrs:
-        send_email(addr, subject, body, html, attachments=attachments)
+        await send_email(addr, subject, body, html, attachments=attachments)
 
 @router.get("")
 async def get_billing(
@@ -218,9 +284,10 @@ async def get_billing(
 
     estimate = _estimate(tenant.get("plan", "PROFESSIONAL"), usage_count)
     billing_status = billing.get('subscription_status', 'none')
+    plan_info = await _plan_override(billing, tenant)
     billing_exempt = bool(billing.get('billing_exempt', False))
     return {
-        "plan": tenant.get("plan"),
+        "plan": plan_info["plan_code"],
         "billing_email": tenant.get("billing_email"),
         "billing_address": tenant.get("billing_address"),
         "settings": billing,
@@ -230,7 +297,86 @@ async def get_billing(
             "current_month_messages": usage_count,
             "total_messages": stats.get("total_messages", 0)
         },
-        "estimate": estimate
+        "estimate": estimate,
+        "included_messages": plan_info["included_messages"],
+        "remaining": (plan_info["included_messages"] - usage_count) if plan_info["included_messages"] is not None else None,
+    }
+
+
+@router.get("/status")
+async def billing_status(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_tenant: Dict[str, Any] = Depends(get_current_tenant),
+    tenant_id: Optional[str] = Query(None),
+):
+    """Return subscription/usage status. Super admin can inspect any tenant via tenant_id."""
+    target_tid = None
+    if tenant_id and current_user.get("role") == "SUPER_ADMIN":
+        try:
+            target_tid = uuid.UUID(tenant_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid tenant id")
+    else:
+        eff = current_tenant.get("id")
+        target_tid = eff if isinstance(eff, uuid.UUID) else uuid.UUID(str(eff))
+
+    tenant = await TenantRepository.get_tenant_by_id_any_status(target_tid)
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    raw_settings = tenant.get("settings") or {}
+    if isinstance(raw_settings, str):
+        try:
+            raw_settings = _json.loads(raw_settings)
+        except Exception:
+            raw_settings = {}
+    billing = dict(raw_settings.get("billing") or {})
+
+    plan_info = await _plan_override(billing, tenant)
+    plan_code = plan_info["plan_code"]
+    included = plan_info["included_messages"]
+    # Persist resolved plan_code/included if newly derived
+    if plan_info and (billing.get("plan_code") != plan_info["plan_code"] or billing.get("included_messages") != included):
+        billing["plan_code"] = plan_info["plan_code"]
+        billing["included_messages"] = included
+        raw_settings["billing"] = billing
+        await TenantRepository.update_tenant(target_tid, settings=raw_settings)
+    start = _month_start(datetime.now(timezone.utc))
+    usage_count = await HL7MessageRepository.count_messages_since(target_tid, start)
+
+    stripe_status = None
+    default_pm = False
+    next_payment_at = None
+    will_autobill = False
+    if stripe is not None:
+        cfg = await settings_service.get_platform_config()
+        stripe_cfg = cfg.get("stripe") or {}
+        secret = stripe_cfg.get("secret_key") or os.getenv("STRIPE_SECRET_KEY")
+        sub_id = billing.get("subscription_id")
+        if secret and sub_id:
+            try:
+                stripe.api_key = secret
+                sub = stripe.Subscription.retrieve(sub_id)
+                stripe_status = sub.get("status")
+                pm = sub.get("default_payment_method")
+                default_pm = bool(pm)
+                ts = sub.get("current_period_end")
+                if ts:
+                    next_payment_at = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+                will_autobill = stripe_status in ("active", "trialing") and default_pm
+            except Exception:
+                stripe_status = None
+
+    return {
+        "plan": plan_code,
+        "included_messages": included,
+        "usage_this_month": usage_count,
+        "remaining": max(0, included - usage_count) if included else None,
+        "billing": billing,
+        "stripe_status": stripe_status,
+        "default_payment_method": default_pm,
+        "next_payment_at": next_payment_at,
+        "will_auto_bill": will_autobill,
     }
 
 
@@ -373,8 +519,19 @@ async def subscribe(
     if provider:
         billing['provider'] = provider
     if plan:
-        # update tenant plan
-        await TenantRepository.update_tenant(tenant_id, plan=plan)
+        # update tenant plan (best-effort) and record selected plan code in billing metadata
+        billing['plan_code'] = plan
+        try:
+            await TenantRepository.update_tenant(tenant_id, plan=plan)
+        except Exception:
+            # ignore enum mismatch; rely on plan_code in billing settings
+            pass
+        try:
+            plan_obj = await PlanRepository.get_plan_by_code(plan)
+            if plan_obj and plan_obj.get("included_messages") is not None:
+                billing["included_messages"] = int(plan_obj.get("included_messages") or 0)
+        except Exception:
+            pass
     if billing_exempt is True and admin_approval is True:
         # Activation requires admin approval: mark tenant inactive, user inactive, and set status pending
         billing['billing_exempt'] = True
@@ -425,10 +582,10 @@ async def subscribe(
                 <p><a href="{approvals_link}">Review pending approvals</a></p>
                 """
             for addr in supers:
-                send_email(addr, subj, body, html)
+                await send_email(addr, subj, body, html)
             # Notify requester/billing contact if present
             if tenant.get('billing_email'):
-                send_email(
+                await send_email(
                     tenant['billing_email'],
                     "Your activation request is pending",
                     "We received your request. A MedDataFlow admin will review and activate your tenant.",
@@ -498,18 +655,8 @@ async def _resolve_tenant_by_customer(customer_id: str) -> Optional[uuid.UUID]:
 async def stripe_webhook(request: Request):
     payload = await request.body()
     sig_header = request.headers.get('Stripe-Signature', '')
-    # Prefer platform config
-    from pathlib import Path as _P
-    import json as _json
-    cfg_path = _P(__file__).resolve().parent.parent / 'config' / 'platform_config.json'
-    secret = None
-    try:
-        if cfg_path.exists():
-            _cfg = _json.loads(cfg_path.read_text())
-            secret = (_cfg.get('stripe') or {}).get('webhook_secret')
-    except Exception:
-        pass
-    secret = secret or os.getenv('STRIPE_WEBHOOK_SECRET')
+    cfg = await settings_service.get_platform_config()
+    secret = (cfg.get('stripe') or {}).get('webhook_secret') or os.getenv('STRIPE_WEBHOOK_SECRET')
     # Minimal verification (timestamp + signature), avoid heavy dependency
     if secret:
         try:
@@ -677,22 +824,10 @@ async def create_stripe_checkout(
     if not plan:
         raise HTTPException(status_code=400, detail="Invalid plan code")
 
-    # Read secret from platform config first
-    from pathlib import Path as _P
-    import json as _json
-    cfg_path = _P(__file__).resolve().parent.parent / 'config' / 'platform_config.json'
-    secret = None
-    try:
-        if cfg_path.exists():
-            _cfg = _json.loads(cfg_path.read_text())
-            secret = (_cfg.get('stripe') or {}).get('secret_key')
-            # Apply coupon lookup from platform config
-            coupon_cfg = _resolve_coupon(coupon_code)
-        else:
-            coupon_cfg = _resolve_coupon(coupon_code)
-    except Exception:
-        coupon_cfg = _resolve_coupon(coupon_code)
-    secret = secret or os.getenv('STRIPE_SECRET_KEY')
+    cfg = await settings_service.get_platform_config()
+    stripe_cfg = cfg.get('stripe') or {}
+    secret = stripe_cfg.get('secret_key') or os.getenv('STRIPE_SECRET_KEY')
+    coupon_cfg = await _resolve_coupon(coupon_code)
     stripe.api_key = secret or ''
     if not stripe.api_key:
         raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY not configured")
@@ -787,18 +922,8 @@ async def finalize_stripe_checkout(
     if stripe is None:
         raise HTTPException(status_code=500, detail="Stripe library not installed")
 
-    # Read secret from platform config first
-    from pathlib import Path as _P
-    import json as _json
-    cfg_path = _P(__file__).resolve().parent.parent / 'config' / 'platform_config.json'
-    secret = None
-    try:
-        if cfg_path.exists():
-            _cfg = _json.loads(cfg_path.read_text())
-            secret = (_cfg.get('stripe') or {}).get('secret_key')
-    except Exception:
-        pass
-    secret = secret or os.getenv('STRIPE_SECRET_KEY')
+    cfg = await settings_service.get_platform_config()
+    secret = (cfg.get('stripe') or {}).get('secret_key') or os.getenv('STRIPE_SECRET_KEY')
     stripe.api_key = secret or ''
     if not stripe.api_key:
         raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY not configured")

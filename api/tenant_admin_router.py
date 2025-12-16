@@ -362,7 +362,7 @@ async def approve_tenant(tenant_id: str):
         # Send to super admins
         for addr in supers:
             logger.info(f"Sending approval notification to super admin: {addr}")
-            send_email(addr, subj_admin, body_admin, html_admin)
+            await send_email(addr, subj_admin, body_admin, html_admin)
 
         # Send to tenant admin users
         tenant_admins_query = """
@@ -375,7 +375,7 @@ async def approve_tenant(tenant_id: str):
             admin_email = admin_row.get('email')
             if admin_email:
                 logger.info(f"Sending activation email to tenant admin: {admin_email}")
-                send_email(
+                await send_email(
                     admin_email,
                     "Your MedDataFlow tenant is active",
                     f"Good news! Your tenant '{tenant.get('name')}' has been approved and is now active. You may log in and begin using the platform.",
@@ -385,7 +385,7 @@ async def approve_tenant(tenant_id: str):
         # Also send to billing email if different
         if tenant.get('billing_email') and tenant.get('billing_email') not in [a.get('email') for a in tenant_admins]:
             logger.info(f"Sending activation email to billing contact: {tenant.get('billing_email')}")
-            send_email(
+            await send_email(
                 tenant['billing_email'],
                 "Your MedDataFlow tenant is active",
                 f"Your tenant '{tenant.get('name')}' has been approved and is now active.",
