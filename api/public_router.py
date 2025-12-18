@@ -3,6 +3,8 @@ Public router to expose non-sensitive tenant auth metadata for login screens
 """
 from typing import Dict, Any, Optional
 from fastapi import APIRouter, Query, HTTPException
+import os
+import httpx
 from pathlib import Path
 import json
 import uuid
@@ -14,6 +16,34 @@ from services.auth_service import AuthService
 from services.settings_service import settings_service
 
 router = APIRouter(prefix="/api/public", tags=["public"])
+# Allow either RECAPTCHA_SECRET_KEY or GOOGLE_RECAPTCHA_SECRET; fall back to provided key for local dev
+RECAPTCHA_SECRET = (
+    os.getenv("RECAPTCHA_SECRET_KEY")
+    or os.getenv("GOOGLE_RECAPTCHA_SECRET")
+    or "6LcmpC0sAAAAAAK6aNW8Rg0SRbAaOL1dyFKe8KI-"
+)
+RECAPTCHA_MIN_SCORE = float(os.getenv("RECAPTCHA_MIN_SCORE", "0.4"))
+
+
+async def verify_recaptcha(token: str, action: str = "tenant_signup"):
+    if not token:
+        raise HTTPException(status_code=400, detail="Missing reCAPTCHA token")
+    if not RECAPTCHA_SECRET:
+        raise HTTPException(status_code=500, detail="reCAPTCHA secret is not configured on the server")
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            res = await client.post(
+                "https://www.google.com/recaptcha/api/siteverify",
+                data={"secret": RECAPTCHA_SECRET, "response": token}
+            )
+        data = res.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Unable to verify reCAPTCHA")
+    success = data.get("success")
+    score = data.get("score", 0)
+    action_resp = data.get("action")
+    if not success or score < RECAPTCHA_MIN_SCORE or (action_resp and action_resp != action):
+        raise HTTPException(status_code=400, detail="reCAPTCHA verification failed")
 
 
 @router.get("/tenant-auth")
@@ -71,13 +101,34 @@ async def tenant_signup(body: Dict[str, Any]):
     slug = body["slug"].strip()
     admin_email = body["admin_email"].strip().lower()
     admin_password = body["admin_password"]
+    recaptcha_token = body.get("recaptcha_token")
+    industry = (body.get("industry") or "").strip() or None
+    team_size = (body.get("team_size") or "").strip() or None
+    primary_use_case = (body.get("primary_use_case") or "").strip() or None
+    ehr_vendor = (body.get("ehr_vendor") or "").strip() or None
+    region = (body.get("region") or "").strip() or None
+    security_contact = (body.get("security_contact") or "").strip() or None
+    onboarding_notes = (body.get("notes") or "").strip() or None
+
+    # Verify reCAPTCHA
+    await verify_recaptcha(recaptcha_token, action="tenant_signup")
 
     # Validate slug availability
     if not await TenantRepository.validate_slug(slug):
         raise HTTPException(status_code=400, detail="Tenant slug already exists")
 
     # Create tenant (inactive by default)
-    tenant = await TenantRepository.create_tenant(name=name, slug=slug)
+    tenant = await TenantRepository.create_tenant(
+        name=name,
+        slug=slug,
+        industry=industry,
+        team_size=team_size,
+        primary_use_case=primary_use_case,
+        ehr_vendor=ehr_vendor,
+        region=region,
+        security_contact=security_contact,
+        onboarding_notes=onboarding_notes
+    )
     tid: uuid.UUID = tenant['id'] if isinstance(tenant['id'], uuid.UUID) else uuid.UUID(str(tenant['id']))
     # Immediately mark inactive
     await TenantRepository.update_tenant(tid, is_active=False)
@@ -128,11 +179,22 @@ async def provision(body: Dict[str, Any]):
     slug = str(body["slug"]).strip()
     admin_email = str(body["admin_email"]).strip().lower()
     admin_password = body["admin_password"]
+    industry = (body.get("industry") or "").strip() or None
+    team_size = (body.get("team_size") or "").strip() or None
+    primary_use_case = (body.get("primary_use_case") or "").strip() or None
+    ehr_vendor = (body.get("ehr_vendor") or "").strip() or None
+    region = (body.get("region") or "").strip() or None
+    security_contact = (body.get("security_contact") or "").strip() or None
+    onboarding_notes = (body.get("notes") or "").strip() or None
+    recaptcha_token = body.get("recaptcha_token")
     activation = str(body["activation"]).strip().lower()
     plan = str(body.get("plan") or "PROFESSIONAL").upper()
     # Accept short codes and normalize
     if plan in {"PRO", "PROF"}:
         plan = "PROFESSIONAL"
+
+    if recaptcha_token:
+        await verify_recaptcha(recaptcha_token, action="tenant_signup")
 
     # Validate slug and email availability
     if not await TenantRepository.validate_slug(slug):
@@ -142,7 +204,18 @@ async def provision(body: Dict[str, Any]):
         raise HTTPException(status_code=400, detail="Email already in use")
 
     # Create tenant active by default, adjust by activation
-    tenant = await TenantRepository.create_tenant(name=name, slug=slug, plan=plan)
+    tenant = await TenantRepository.create_tenant(
+        name=name,
+        slug=slug,
+        plan=plan,
+        industry=industry,
+        team_size=team_size,
+        primary_use_case=primary_use_case,
+        ehr_vendor=ehr_vendor,
+        region=region,
+        security_contact=security_contact,
+        onboarding_notes=onboarding_notes
+    )
     tid = tenant['id'] if isinstance(tenant['id'], uuid.UUID) else uuid.UUID(str(tenant['id']))
 
     # Create admin user

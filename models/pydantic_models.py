@@ -67,6 +67,13 @@ class TenantBase(BaseModelConfig):
     oauth_config: Optional[Dict[str, Any]] = None
     billing_email: Optional[str] = None
     billing_address: Optional[str] = None
+    industry: Optional[str] = None
+    team_size: Optional[str] = None
+    primary_use_case: Optional[str] = None
+    ehr_vendor: Optional[str] = None
+    region: Optional[str] = None
+    security_contact: Optional[str] = None
+    onboarding_notes: Optional[str] = None
     settings: Dict[str, Any] = Field(default_factory=dict)
 
 class TenantCreate(TenantBase):
@@ -82,6 +89,13 @@ class TenantUpdate(BaseModelConfig):
     oauth_config: Optional[Dict[str, Any]] = None
     billing_email: Optional[str] = None
     billing_address: Optional[str] = None
+    industry: Optional[str] = None
+    team_size: Optional[str] = None
+    primary_use_case: Optional[str] = None
+    ehr_vendor: Optional[str] = None
+    region: Optional[str] = None
+    security_contact: Optional[str] = None
+    onboarding_notes: Optional[str] = None
     settings: Optional[Dict[str, Any]] = None
 
 class Tenant(TenantBase):

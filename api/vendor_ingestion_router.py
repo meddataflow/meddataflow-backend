@@ -120,6 +120,12 @@ async def validate_api_key(credentials: HTTPAuthorizationCredentials = Depends(s
         "ack_profile": vendor_endpoint.get('ack_profile')
     }
 
+def _is_truthy(val: Any) -> bool:
+    """Normalize truthy flags coming from JSON or strings."""
+    if isinstance(val, str):
+        return val.strip().lower() in {"true", "1", "yes", "y", "on"}
+    return bool(val)
+
 async def check_rate_limit(vendor_info: Dict[str, Any], request: Request) -> bool:
     """
     Check if the vendor has exceeded their rate limit
@@ -266,9 +272,19 @@ async def _ingest_vendor_message_internal(
             logger.warning("[PLAN ENFORCEMENT] Missing included_messages for tenant=%s plan_code=%s billing=%s", tenant.get('id'), plan_code, billing_settings)
             raise HTTPException(status_code=402, detail="Plan limits not configured. Please set included_messages in billing settings.")
 
+        original_billing_exempt = billing_settings.get('billing_exempt')
+        billing_exempt = _is_truthy(original_billing_exempt)
+        # Normalize persisted flag so future reads don't misinterpret strings
+        billing_settings['billing_exempt'] = billing_exempt
+
+        persist_billing = False
         if billing_settings.get("included_messages") != plan_included or billing_settings.get("plan_code") != plan_code:
             billing_settings["included_messages"] = plan_included
             billing_settings["plan_code"] = plan_code
+            persist_billing = True
+        if original_billing_exempt != billing_exempt:
+            persist_billing = True
+        if persist_billing:
             raw_settings["billing"] = billing_settings
             tid = tenant.get('id')
             tid = tid if isinstance(tid, uuid.UUID) else uuid.UUID(str(tid))
@@ -276,8 +292,6 @@ async def _ingest_vendor_message_internal(
                 await TenantRepository.update_tenant(tid, settings=raw_settings)
             except Exception:
                 pass
-
-        billing_exempt = bool(billing_settings.get('billing_exempt', False))
         projected = usage_count + incoming_count
         debug_info = {
             "tenant_id": str(vendor_info['tenant_id']),

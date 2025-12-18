@@ -643,13 +643,24 @@ def _find_tenant_by_customer_id(customer_id: str) -> Optional[uuid.UUID]:
 
 async def _resolve_tenant_by_customer(customer_id: str) -> Optional[uuid.UUID]:
     from models.tenant import TenantRepository
-    tenants = await TenantRepository.get_all_tenants()
+    # Include inactive tenants so brand-new signups (inactive until payment) can be resolved
+    tenants = await TenantRepository.get_all_tenants_any_status()
     for t in tenants:
         settings = t.get('settings') or {}
         billing = settings.get('billing') or {}
         if str(billing.get('customer_id')) == str(customer_id):
             return t['id'] if isinstance(t['id'], uuid.UUID) else uuid.UUID(str(t['id']))
     return None
+
+async def _activate_tenant(tenant_id: uuid.UUID, settings: Optional[Dict[str, Any]] = None) -> None:
+    """Activate tenant after successful payment events; optionally persist settings."""
+    updates: Dict[str, Any] = {"is_active": True}
+    if settings is not None:
+        updates["settings"] = settings
+    try:
+        await TenantRepository.update_tenant(tenant_id, **updates)
+    except Exception:
+        logger.warning("Stripe webhook: failed to activate tenant %s", tenant_id)
 
 @router.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
@@ -685,17 +696,30 @@ async def stripe_webhook(request: Request):
         if not tid and tenant_id:
             tid = tenant_id
         if tid and (sub_id or cust_id):
-            tenant = await TenantRepository.get_tenant_by_id(tid)
-            settings = dict(tenant.get('settings') or {})
-            billing = dict(settings.get('billing') or {})
-            if sub_id:
-                billing['subscription_id'] = sub_id
-            if cust_id:
-                billing['customer_id'] = cust_id
-            billing['provider'] = 'stripe'
-            billing['subscription_status'] = 'active'
-            settings['billing'] = billing
-            await TenantRepository.update_tenant(tid, settings=settings)
+            tenant = await TenantRepository.get_tenant_by_id_any_status(tid)
+            if not tenant:
+                logger.warning("Stripe webhook: tenant %s not found for checkout.session.completed", tid)
+            else:
+                settings = dict(tenant.get('settings') or {})
+                billing = dict(settings.get('billing') or {})
+                if sub_id:
+                    billing['subscription_id'] = sub_id
+                if cust_id:
+                    billing['customer_id'] = cust_id
+                billing['provider'] = 'stripe'
+                billing['subscription_status'] = 'active'
+                if billing.get('billing_exempt') is True:
+                    billing['billing_exempt'] = False
+                try:
+                    plan_info = await _plan_override(billing, tenant)
+                    if plan_info:
+                        billing['plan_code'] = plan_info.get('plan_code') or billing.get('plan_code')
+                        billing['included_messages'] = plan_info.get('included_messages')
+                except Exception:
+                    pass
+                settings['billing'] = billing
+                # Persist billing details and activate the tenant after successful checkout
+                await _activate_tenant(tid, settings=settings)
 
     # Record invoices (paid/finalized) and send invoice email
     if event_type in ('invoice.paid', 'invoice.finalized'):
@@ -751,17 +775,33 @@ async def stripe_webhook(request: Request):
         sid = obj.get('id')
         tid = await _resolve_tenant_by_customer(cust_id) if cust_id else None
         if tid:
-            tenant = await TenantRepository.get_tenant_by_id(tid)
-            settings = dict(tenant.get('settings') or {})
-            billing = dict(settings.get('billing') or {})
-            if sid:
-                billing['subscription_id'] = sid
-            if cust_id:
-                billing['customer_id'] = cust_id
-            if status_val:
-                billing['subscription_status'] = status_val
-            settings['billing'] = billing
-            await TenantRepository.update_tenant(tid, settings=settings)
+            tenant = await TenantRepository.get_tenant_by_id_any_status(tid)
+            if not tenant:
+                logger.warning("Stripe webhook: tenant %s not found for subscription event", tid)
+            else:
+                settings = dict(tenant.get('settings') or {})
+                billing = dict(settings.get('billing') or {})
+                if sid:
+                    billing['subscription_id'] = sid
+                if cust_id:
+                    billing['customer_id'] = cust_id
+                if status_val:
+                    billing['subscription_status'] = status_val
+                if status_val in ('active', 'trialing'):
+                    try:
+                        plan_info = await _plan_override(billing, tenant)
+                        if plan_info:
+                            billing['plan_code'] = plan_info.get('plan_code') or billing.get('plan_code')
+                            billing['included_messages'] = plan_info.get('included_messages')
+                    except Exception:
+                        pass
+                settings['billing'] = billing
+                if status_val in ('active', 'trialing'):
+                    if billing.get('billing_exempt') is True:
+                        billing['billing_exempt'] = False
+                    await _activate_tenant(tid, settings=settings)
+                else:
+                    await TenantRepository.update_tenant(tid, settings=settings)
 
     return {"received": True}
 
@@ -963,6 +1003,15 @@ async def finalize_stripe_checkout(
             billing['customer_id'] = cust_id
         billing['provider'] = 'stripe'
         billing['subscription_status'] = 'active'
+        if billing.get('billing_exempt') is True:
+            billing['billing_exempt'] = False
+        try:
+            plan_info = await _plan_override(billing, tenant)
+            if plan_info:
+                billing['plan_code'] = plan_info.get('plan_code') or billing.get('plan_code')
+                billing['included_messages'] = plan_info.get('included_messages')
+        except Exception:
+            pass
         settings['billing'] = billing
         await TenantRepository.update_tenant(tenant_id, settings=settings, is_active=True)
 

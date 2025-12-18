@@ -12,6 +12,8 @@ import json
 
 from models.vendor_endpoint import VendorEndpointRepository
 from models.hl7_message import HL7MessageRepository
+from models.tenant import TenantRepository
+from models.plan import PlanRepository
 from services.workflow_execution_service import WorkflowExecutionService
 from services.hl7_parser import HL7Parser
 from database.connection import get_pool
@@ -152,6 +154,12 @@ class MessageProcessingQueue:
 # Global message processing queue
 message_queue = MessageProcessingQueue()
 
+def _is_truthy(val: Any) -> bool:
+    """Normalize truthy flags coming from JSON or strings."""
+    if isinstance(val, str):
+        return val.strip().lower() in {"true", "1", "yes", "y", "on"}
+    return bool(val)
+
 async def authenticate_vendor_request(
     vendor_slug: str,
     credentials: HTTPAuthorizationCredentials = Depends(security)
@@ -223,6 +231,71 @@ async def ingest_hl7_message(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Empty message body"
+            )
+
+        # Enforce plan limits (single-message ingest)
+        tenant = await TenantRepository.get_tenant_by_id_any_status(vendor_endpoint['tenant_id'])
+        if not tenant:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
+        raw_settings = tenant.get("settings") or {}
+        if isinstance(raw_settings, str):
+            try:
+                raw_settings = json.loads(raw_settings) or {}
+            except Exception:
+                raw_settings = {}
+        billing = dict(raw_settings.get("billing") or {}) if isinstance(raw_settings, dict) else {}
+        plan_code = str(billing.get("plan_code") or tenant.get("plan") or "UNKNOWN").upper()
+
+        start_month = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        tid_obj = vendor_endpoint["tenant_id"] if isinstance(vendor_endpoint["tenant_id"], uuid.UUID) else uuid.UUID(str(vendor_endpoint["tenant_id"]))
+        usage_count = await HL7MessageRepository.count_messages_since(tid_obj, start_month)
+
+        plan_included: Optional[int] = None
+        try:
+            if billing.get("included_messages") is not None:
+                plan_included = int(billing.get("included_messages"))
+        except Exception:
+            plan_included = None
+        if plan_included is None and plan_code and plan_code != "UNKNOWN":
+            try:
+                plan_obj = await PlanRepository.get_plan_by_code(plan_code)
+                if plan_obj and plan_obj.get("included_messages") is not None:
+                    plan_included = int(plan_obj["included_messages"])
+            except Exception:
+                plan_included = None
+
+        if plan_included is None or plan_included <= 0:
+            raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Plan limits not configured for this tenant")
+
+        original_billing_exempt = billing.get("billing_exempt")
+        billing_exempt = _is_truthy(original_billing_exempt)
+        # Paid/active subscriptions should not remain exempt
+        sub_status = str(billing.get("subscription_status") or "").lower()
+        if billing_exempt and sub_status in {"active", "trialing"}:
+            billing_exempt = False
+        billing["billing_exempt"] = billing_exempt
+
+        persist_billing = False
+        if billing.get("included_messages") != plan_included or billing.get("plan_code") != plan_code:
+            billing["included_messages"] = plan_included
+            billing["plan_code"] = plan_code
+            persist_billing = True
+        if original_billing_exempt != billing_exempt:
+            persist_billing = True
+        if persist_billing:
+            raw_settings["billing"] = billing
+            try:
+                tid = vendor_endpoint["tenant_id"]
+                tid = tid if isinstance(tid, uuid.UUID) else uuid.UUID(str(tid))
+                await TenantRepository.update_tenant(tid, settings=raw_settings)
+            except Exception:
+                pass
+
+        projected = usage_count + 1
+        if not billing_exempt and projected > plan_included:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail=f"Plan limit exceeded: used {usage_count} of {plan_included} messages this period"
             )
 
         # Check rate limiting

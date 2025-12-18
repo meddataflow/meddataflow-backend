@@ -245,7 +245,8 @@ class TenantService:
         name: str,
         slug: str,
         domain: Optional[str] = None,
-        billing_email: Optional[str] = None
+        billing_email: Optional[str] = None,
+        **metadata: Any
     ) -> Dict[str, Any]:
         """Create a new tenant"""
         # Validate slug availability
@@ -259,7 +260,8 @@ class TenantService:
             name=name,
             slug=slug,
             domain=domain,
-            billing_email=billing_email
+            billing_email=billing_email,
+            **metadata
         )
     
     @staticmethod

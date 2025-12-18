@@ -25,7 +25,14 @@ class TenantRepository:
         slug: str,
         domain: Optional[str] = None,
         plan: TenantPlan | str = TenantPlan.PROFESSIONAL,
-        billing_email: Optional[str] = None
+        billing_email: Optional[str] = None,
+        industry: Optional[str] = None,
+        team_size: Optional[str] = None,
+        primary_use_case: Optional[str] = None,
+        ehr_vendor: Optional[str] = None,
+        region: Optional[str] = None,
+        security_contact: Optional[str] = None,
+        onboarding_notes: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a new tenant"""
         tenant_id = uuid.uuid4()
@@ -41,14 +48,37 @@ class TenantRepository:
         query = """
         INSERT INTO tenants (
             id, name, slug, domain, plan, is_active, database_type,
-            api_key, billing_email, settings, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
+            api_key, billing_email, industry, team_size, primary_use_case,
+            ehr_vendor, region, security_contact, onboarding_notes,
+            settings, created_at, updated_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7,
+            $8, $9, $10, $11, $12, $13, $14, $15, $16,
+            $17, $18, $18
+        )
         RETURNING *
         """
         
         return await execute_returning(
-            query, tenant_id, name, slug, domain, plan.value, True,
-            DatabaseType.SHARED.value, api_key, billing_email, '{}', now
+            query,
+            tenant_id,
+            name,
+            slug,
+            domain,
+            plan.value,
+            True,
+            DatabaseType.SHARED.value,
+            api_key,
+            billing_email,
+            industry,
+            team_size,
+            primary_use_case,
+            ehr_vendor,
+            region,
+            security_contact,
+            onboarding_notes,
+            '{}',
+            now
         )
     
     @staticmethod
@@ -168,7 +198,9 @@ class TenantRepository:
         allowed_fields = [
             'name', 'domain', 'plan', 'is_active', 'database_type', 
             'database_url', 'sso_enabled', 'saml_config', 'oauth_config',
-            'billing_email', 'billing_address', 'settings'
+            'billing_email', 'billing_address', 'settings',
+            'industry', 'team_size', 'primary_use_case', 'ehr_vendor',
+            'region', 'security_contact', 'onboarding_notes'
         ]
         
         json_fields = {"settings", "saml_config", "oauth_config"}

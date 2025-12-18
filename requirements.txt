@@ -22,6 +22,7 @@ aiomysql>=0.2.0
 
 # HTTP client for integrations
 httpx>=0.26.0
+psycopg2-binary>=2.9.9
 urllib3>=2.6.0
 
 # AWS/S3 integration

@@ -23,6 +23,14 @@ class TenantCreateRequest(BaseModel):
     slug: str
     domain: Optional[str] = None
     billing_email: Optional[str] = None
+    billing_address: Optional[str] = None
+    industry: Optional[str] = None
+    team_size: Optional[str] = None
+    primary_use_case: Optional[str] = None
+    ehr_vendor: Optional[str] = None
+    region: Optional[str] = None
+    security_contact: Optional[str] = None
+    onboarding_notes: Optional[str] = None
 
 
 class TenantUpdateRequest(BaseModel):
@@ -32,6 +40,13 @@ class TenantUpdateRequest(BaseModel):
     is_active: Optional[bool] = None
     billing_email: Optional[str] = None
     billing_address: Optional[str] = None
+    industry: Optional[str] = None
+    team_size: Optional[str] = None
+    primary_use_case: Optional[str] = None
+    ehr_vendor: Optional[str] = None
+    region: Optional[str] = None
+    security_contact: Optional[str] = None
+    onboarding_notes: Optional[str] = None
     settings: Optional[Dict[str, Any]] = None
 
 
@@ -62,6 +77,13 @@ async def list_tenants():
             'domain': t.get("domain"),
             'plan': t.get("plan"),
             'is_active': t.get("is_active", True),
+            'industry': t.get("industry"),
+            'team_size': t.get("team_size"),
+            'primary_use_case': t.get("primary_use_case"),
+            'ehr_vendor': t.get("ehr_vendor"),
+            'region': t.get("region"),
+            'security_contact': t.get("security_contact"),
+            'onboarding_notes': t.get("onboarding_notes"),
             'user_count': t.get('user_count', 0),
             'workflow_count': t.get('workflow_count', 0),
             'created_at': t.get('created_at'),
@@ -80,6 +102,13 @@ async def create_tenant(body: TenantCreateRequest):
         slug=body.slug,
         domain=body.domain,
         billing_email=body.billing_email,
+        industry=body.industry,
+        team_size=body.team_size,
+        primary_use_case=body.primary_use_case,
+        ehr_vendor=body.ehr_vendor,
+        region=body.region,
+        security_contact=body.security_contact,
+        onboarding_notes=body.onboarding_notes,
     )
     return {
         'id': str(tenant['id']),
