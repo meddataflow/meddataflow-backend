@@ -28,6 +28,16 @@ class MFAResetRepository:
         return rec
 
     @staticmethod
+    async def invalidate_for_user(user_id: uuid.UUID) -> None:
+        query = """
+        UPDATE mfa_reset_tokens
+        SET used_at = NOW()
+        WHERE user_id = $1
+          AND used_at IS NULL
+        """
+        await execute(query, user_id)
+
+    @staticmethod
     async def get_valid_by_token(token_plain: str) -> Optional[Dict[str, Any]]:
         token_hash = _hash_token(token_plain)
         query = """

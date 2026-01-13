@@ -6,6 +6,7 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 import os
+import logging
 from pydantic import BaseModel, EmailStr
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -14,12 +15,26 @@ from slowapi.util import get_remote_address
 limiter = Limiter(key_func=get_remote_address)
 
 from services.auth_service import AuthService, TenantService
+from services.email_service import send_email
 from api.auth_deps import get_current_user, get_current_tenant, require_super_admin
 from models.user import UserRole, UserRepository
 from models.password_reset import PasswordResetRepository
 from models.mfa_reset import MFAResetRepository
 
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
+logger = logging.getLogger(__name__)
+
+
+def _get_frontend_base_url() -> str:
+    base = os.getenv('FRONTEND_URL') or os.getenv('PUBLIC_BASE_URL') or os.getenv('NEXT_PUBLIC_BASE_URL') or 'https://meddataflow.com'
+    return base.rstrip('/')
+
+
+def _build_reset_url(path: str, token: str) -> Optional[str]:
+    base = _get_frontend_base_url()
+    if not base:
+        return None
+    return f"{base}{path}?token={token}"
 
 # Pydantic models
 class LoginRequest(BaseModel):
@@ -101,8 +116,6 @@ class ForgotPasswordRequest(BaseModel):
 
 class ForgotPasswordResponse(BaseModel):
     requested: bool
-    # For demo/dev: include reset_url if available (do not rely on this in production)
-    reset_url: Optional[str] = None
 
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -119,7 +132,6 @@ class Forgot2FARequest(BaseModel):
 
 class Forgot2FAResponse(BaseModel):
     requested: bool
-    reset_url: Optional[str] = None
 
 class Reset2FARequest(BaseModel):
     token: str
@@ -473,27 +485,36 @@ async def forgot_password(request: Request, req: ForgotPasswordRequest):
     if not user:
         user = await UserRepository.get_user_by_email(req.email)
 
-    reset_url: Optional[str] = None
     try:
         if user and user.get('password_hash'):
             # Create reset request
             import uuid as _uuid
             uid = user['id'] if isinstance(user['id'], _uuid.UUID) else _uuid.UUID(str(user['id']))
+            await PasswordResetRepository.invalidate_for_user(uid)
             pr = await PasswordResetRepository.create_request(uid, ttl_minutes=30)
-            # In lieu of email integration, return a reset URL for convenience (demo/dev)
-            base = os.getenv('FRONTEND_URL') or os.getenv('PUBLIC_BASE_URL') or ''
-            if base:
-                reset_url = f"{base}/auth/reset-password?token={pr['token']}"
+            reset_link = _build_reset_url("/auth/reset-password", pr['token'])
+            if reset_link:
+                subject = "Reset your MedDataFlow password"
+                body = (
+                    "We received a request to reset your MedDataFlow password.\n\n"
+                    f"Reset link:\n{reset_link}\n\n"
+                    "This link expires in 30 minutes. If you did not request this, you can ignore this email."
+                )
+                html = (
+                    "<p>We received a request to reset your MedDataFlow password.</p>"
+                    f"<p><a href=\"{reset_link}\">Reset your password</a></p>"
+                    "<p>This link expires in 30 minutes. If you did not request this, you can ignore this email.</p>"
+                )
+                await send_email(user.get('email') or req.email, subject, body, html)
             else:
-                reset_url = f"/auth/reset-password?token={pr['token']}"
-            # TODO: integrate with email service here
-    except Exception:
-        # swallow errors to avoid leaking info
-        pass
-    return ForgotPasswordResponse(requested=True, reset_url=reset_url)
+                logger.warning("Password reset requested but FRONTEND_URL/PUBLIC_BASE_URL is not set; email not sent.")
+    except Exception as exc:
+        logger.warning(f"Failed to process password reset email: {exc}")
+    return ForgotPasswordResponse(requested=True)
 
 @router.post("/reset-password", response_model=ResetPasswordResponse)
-async def reset_password(req: ResetPasswordRequest):
+@limiter.limit("5/minute")
+async def reset_password(request: Request, req: ResetPasswordRequest):
     if req.confirm_password is not None and req.confirm_password != req.new_password:
         raise HTTPException(status_code=400, detail="Passwords do not match")
     # Validate token
@@ -527,26 +548,37 @@ async def forgot_2fa(req: Forgot2FARequest):
     if not user:
         user = await UserRepository.get_user_by_email(req.email)
 
-    reset_url: Optional[str] = None
     try:
         # Only allow if user exists, is verified, and has 2FA enabled
         if user and user.get('is_verified') and user.get('two_factor_enabled'):
             import uuid as _uuid
             uid = user['id'] if isinstance(user['id'], _uuid.UUID) else _uuid.UUID(str(user['id']))
+            await MFAResetRepository.invalidate_for_user(uid)
             rec = await MFAResetRepository.create_request(uid, ttl_minutes=30)
-            base = os.getenv('FRONTEND_URL') or os.getenv('PUBLIC_BASE_URL') or ''
-            if base:
-                reset_url = f"{base}/auth/reset-2fa?token={rec['token']}"
+            reset_link = _build_reset_url("/auth/reset-2fa", rec['token'])
+            if reset_link:
+                subject = "Reset your MedDataFlow two-factor authentication"
+                body = (
+                    "We received a request to reset two-factor authentication on your MedDataFlow account.\n\n"
+                    f"Reset link:\n{reset_link}\n\n"
+                    "This link expires in 30 minutes. If you did not request this, you can ignore this email."
+                )
+                html = (
+                    "<p>We received a request to reset two-factor authentication on your MedDataFlow account.</p>"
+                    f"<p><a href=\"{reset_link}\">Reset two-factor authentication</a></p>"
+                    "<p>This link expires in 30 minutes. If you did not request this, you can ignore this email.</p>"
+                )
+                await send_email(user.get('email') or req.email, subject, body, html)
             else:
-                reset_url = f"/auth/reset-2fa?token={rec['token']}"
-            # TODO: send email with reset link
-    except Exception:
-        pass
-    return Forgot2FAResponse(requested=True, reset_url=reset_url)
+                logger.warning("2FA reset requested but FRONTEND_URL/PUBLIC_BASE_URL is not set; email not sent.")
+    except Exception as exc:
+        logger.warning(f"Failed to process 2FA reset email: {exc}")
+    return Forgot2FAResponse(requested=True)
 
 
 @router.post("/reset-2fa", response_model=Reset2FAResponse)
-async def reset_2fa(req: Reset2FARequest):
+@limiter.limit("5/minute")
+async def reset_2fa(request: Request, req: Reset2FARequest):
     pr = await MFAResetRepository.get_valid_by_token(req.token)
     if not pr:
         raise HTTPException(status_code=400, detail="Invalid or expired token")
