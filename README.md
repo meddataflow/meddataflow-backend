@@ -66,6 +66,8 @@ meddataflow is a modern HL7 message integration platform designed to streamline 
    ```
    Update `.env` with your database credentials and other settings.
 
+   Stripe and SMTP secrets should stay in `.env` or the super-admin settings UI only. Do not commit live credentials to `config/platform_config.json`; the checked-in file is intentionally blank and only documents the JSON shape used for legacy migration.
+
 ## Running the Application
 
 ### Local Development
